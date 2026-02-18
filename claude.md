@@ -311,6 +311,114 @@ You are here to:
 4. Improve continuously  
 5. Deliver production-ready artifacts  
 
-Accuracy over speed.  
-Structure over improvisation.  
-Validation over assumption.  
+Accuracy over speed.
+Structure over improvisation.
+Validation over assumption.
+
+---
+
+# 📂 FULL FILE STRUCTURE (CURRENT STATE)
+
+```
+/
+├── app.py                          # FastAPI entrypoint (POST /build, GET /health)
+├── claude.md                       # This file — project instructions
+├── demo_build.py                   # CLI demo runner (not used by app.py)
+├── Dockerfile                      # Python 3.11, reads $PORT from env
+├── requirements.txt                # fastapi, uvicorn, pydantic, sqlalchemy, psycopg2-binary
+├── .env                            # Credentials (gitignored)
+├── .gitignore
+│
+├── db/                             # PostgreSQL persistence layer
+│   ├── __init__.py
+│   ├── schema.sql                  # DDL: projects, builds, build_artifacts, assumptions
+│   ├── session.py                  # SQLAlchemy engine, SessionLocal, get_db(), check_db()
+│   ├── models.py                   # ORM: Project, Build, BuildArtifact, Assumption
+│   └── repo.py                     # create_build(), store_artifact(), finalize_build()
+│
+├── tools/                          # Deterministic execution layer (no AI reasoning)
+│   ├── __init__.py
+│   ├── module_registry.json        # 16 modules, version 1.0.0
+│   ├── module_registry_loader.py   # load_module_registry(), get_module()
+│   ├── canonical_spec_schema.json  # JSON Schema for canonical spec (not yet wired)
+│   ├── normalize_to_canonical_spec.py  # plan → canonical spec
+│   ├── validate_canonical_spec.py      # 47 rules, returns validation report
+│   ├── generate_make_export.py         # canonical spec → Make.com blueprint
+│   ├── validate_make_export.py         # 30 rules, returns validation report
+│   ├── self_heal_make_export.py        # 17 repairable rules, max 2 retries
+│   ├── confidence_scorer.py            # 0.0–1.0 score + grade
+│   ├── graph_integrity_check.py        # DAG validation, orphan detection
+│   ├── data_mapping_extractor.py       # {{N.field}} reference extraction
+│   ├── spec_version_manager.py         # Filesystem versioning (backward compat)
+│   ├── build_scenario_pipeline.py      # Orchestrator (656 lines, dual DB/filesystem)
+│   ├── timeline_estimator.py           # Heuristic implementation timeline
+│   ├── cost_estimator.py               # Make.com ops/cost estimation
+│   ├── delivery_packager.py            # summary_md + pack_json generation
+│   ├── assumption_tracker.py           # Built, NOT wired into pipeline
+│   ├── delivery_adapter.py             # Built, NOT wired into pipeline
+│   └── generate_delivery_assessment.py # Built, NOT wired into pipeline
+│
+├── workflows/                      # Markdown planning docs
+│   ├── phase1_canonical_spec.md
+│   ├── phase2_make_export.md
+│   ├── phase3_make_export_validation.md
+│   ├── phase4_self_healing.md
+│   └── phase5_pipeline_and_versioning.md
+│
+└── output/                         # Filesystem artifacts (legacy, replaced by DB)
+    ├── index.json
+    └── <slug>/vN/*.json|*.md
+```
+
+# 🗄 DATABASE ARCHITECTURE
+
+## Persistence Flow
+
+```
+POST /build → app.py
+  ├── db = Depends(get_db)
+  └── build_scenario_pipeline(db_session=db, project_name="default")
+        ├── create_build(db, project_name, slug, ...)
+        │     ├── upsert project by name
+        │     ├── pg_advisory_xact_lock(hashtext(pid || ':' || slug))
+        │     ├── SELECT COALESCE(MAX(version),0)+1
+        │     └── INSERT build (status='running')
+        ├── [phases 1-4: normalize → validate → generate → heal]
+        ├── store_artifact() × 10
+        ├── finalize_build(db, build_id, "success", ...)
+        └── return result dict
+  → db.commit() on success
+  → db.rollback() on exception
+```
+
+## Tables (db/schema.sql)
+
+- **projects**: id uuid pk, name unique, created_at
+- **builds**: id uuid pk, project_id fk, slug, version, original_request, status, confidence_score/grade, canonical_valid, export_valid, heal_attempts, failure_reason — UNIQUE(project_id, slug, version)
+- **build_artifacts**: id uuid pk, build_id fk, artifact_type text, content_json jsonb, content_text text — UNIQUE(build_id, artifact_type)
+- **assumptions**: id uuid pk, build_id fk, type, description, severity, created_at
+
+## 10 Artifact Types Stored Per Build
+
+canonical_spec, make_export, validation_report, export_validation_report,
+confidence, build_log, timeline, cost_estimate, customer_delivery_summary, delivery_pack
+
+## Dual Persistence
+
+- **db_session provided** → all artifacts go to PostgreSQL (production path)
+- **db_session=None + base_output_dir** → filesystem writes (self-test backward compat)
+- Self-tests (`python -m tools.build_scenario_pipeline`) use filesystem, pass 8/8 checks
+
+# 🔧 KNOWN GAPS (NOT YET IMPLEMENTED)
+
+- Authentication / authorization on API endpoints
+- Agent reasoning layer (system is currently a deterministic compiler)
+- canonical_spec_schema.json not wired for runtime validation
+- assumption_tracker.py, delivery_adapter.py, generate_delivery_assessment.py built but not wired
+- Confidence not recalculated after self-healing
+- No structured logging, rate limiting, or concurrency protection beyond advisory locks
+- 3 tools built but unused in pipeline
+
+# 🔗 REPOSITORY
+
+GitHub: https://github.com/Brian2169fdsa/agenticmakebuilder
