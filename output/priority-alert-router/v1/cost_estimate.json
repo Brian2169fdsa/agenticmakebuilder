@@ -1,0 +1,27 @@
+{
+  "ops_per_execution": 5,
+  "executions_per_month": 100,
+  "ops_per_month": 500,
+  "integration_setup": {
+    "builtin": 0.0,
+    "gateway": 0.0,
+    "google-sheets": 0.0,
+    "json": 0.0,
+    "slack": 0.0
+  },
+  "total_setup_cost": 0.0,
+  "recommended_plan": {
+    "name": "Free",
+    "ops_per_month": 1000,
+    "monthly_cost": 0.0
+  },
+  "monthly_operational_cost": 0.0,
+  "annual_estimate": 0.0,
+  "notes": [
+    "Trigger (gateway:CustomWebHook): 1 op",
+    "4 module(s): 4 op(s)",
+    "Recommended plan: Make.com Free (1,000 ops/month)",
+    "Estimated 500 ops/month at 100 executions/month",
+    "Apps requiring OAuth/API key setup: google-sheets, slack"
+  ]
+}

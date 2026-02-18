@@ -1,0 +1,80 @@
+{
+  "spec_version": "1.0.0",
+  "scenario": {
+    "name": "Webhook to Slack Notifier",
+    "description": "Receives webhook data, parses JSON payload, and posts a notification to Slack.",
+    "slug": "webhook-to-slack-notifier"
+  },
+  "trigger": {
+    "id": 1,
+    "type": "webhook",
+    "module": "gateway:CustomWebHook",
+    "label": "Incoming Webhook",
+    "version": 1,
+    "parameters": {
+      "hook": "__WEBHOOK_ID__"
+    },
+    "credential_placeholder": null
+  },
+  "modules": [
+    {
+      "id": 2,
+      "label": "Parse Webhook Body",
+      "app": "json",
+      "module": "json:ParseJSON",
+      "module_type": "transformer",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "json": "{{1.body}}"
+      },
+      "credential_placeholder": null,
+      "onerror": null,
+      "resume_value": null
+    },
+    {
+      "id": 3,
+      "label": "Post to Slack",
+      "app": "slack",
+      "module": "slack:PostMessage",
+      "module_type": "action",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "channel": "#notifications",
+        "text": "New event: {{2.event_type}} from {{2.source}}"
+      },
+      "credential_placeholder": "__SLACK_CONNECTION__",
+      "onerror": "ignore",
+      "resume_value": null
+    }
+  ],
+  "connections": [
+    {
+      "from": "trigger",
+      "to": 2,
+      "filter": null,
+      "label": null
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "filter": null,
+      "label": null
+    }
+  ],
+  "error_handling": {
+    "default_strategy": "ignore",
+    "max_errors": 3,
+    "module_overrides": []
+  },
+  "metadata": {
+    "created_at": "2026-02-16T21:27:47Z",
+    "updated_at": null,
+    "original_request": "When a webhook fires, parse the data and notify Slack",
+    "agent_notes": [
+      "Assumed webhook payload contains event_type and source fields"
+    ],
+    "build_version": null
+  }
+}

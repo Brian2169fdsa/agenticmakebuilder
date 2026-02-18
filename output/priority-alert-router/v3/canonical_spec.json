@@ -1,0 +1,139 @@
+{
+  "spec_version": "1.0.0",
+  "scenario": {
+    "name": "Priority Alert Router",
+    "description": "Receives events via webhook, routes high-priority events to a Slack alert channel, and logs all events to a Google Sheet.",
+    "slug": "priority-alert-router"
+  },
+  "trigger": {
+    "id": 1,
+    "type": "webhook",
+    "module": "gateway:CustomWebHook",
+    "label": "Receive Event",
+    "version": 1,
+    "parameters": {
+      "hook": "__WEBHOOK_ID__"
+    },
+    "credential_placeholder": null
+  },
+  "modules": [
+    {
+      "id": 2,
+      "label": "Parse Event Payload",
+      "app": "json",
+      "module": "json:ParseJSON",
+      "module_type": "transformer",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "json": "{{1.body}}"
+      },
+      "credential_placeholder": null,
+      "onerror": null,
+      "resume_value": null
+    },
+    {
+      "id": 3,
+      "label": "Route by Priority",
+      "app": "builtin",
+      "module": "builtin:BasicRouter",
+      "module_type": "flow_control",
+      "version": 1,
+      "parameters": {},
+      "mapper": {},
+      "credential_placeholder": null,
+      "onerror": null,
+      "resume_value": null
+    },
+    {
+      "id": 4,
+      "label": "Send Urgent Alert",
+      "app": "slack",
+      "module": "slack:PostMessage",
+      "module_type": "action",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "channel": "#urgent-alerts",
+        "text": "URGENT: {{2.title}} \u2014 {{2.description}}"
+      },
+      "credential_placeholder": "__SLACK_CONNECTION__",
+      "onerror": "break",
+      "resume_value": null
+    },
+    {
+      "id": 5,
+      "label": "Log to Event Tracker",
+      "app": "google-sheets",
+      "module": "google-sheets:addRow",
+      "module_type": "action",
+      "version": 2,
+      "parameters": {
+        "spreadsheetId": "__SPREADSHEET_ID__",
+        "sheetId": "__SHEET_ID__"
+      },
+      "mapper": {
+        "values": [
+          "{{2.timestamp}}",
+          "{{2.priority}}",
+          "{{2.title}}"
+        ]
+      },
+      "credential_placeholder": "__GOOGLE_SHEETS_CONNECTION__",
+      "onerror": null,
+      "resume_value": null
+    }
+  ],
+  "connections": [
+    {
+      "from": "trigger",
+      "to": 2,
+      "filter": null,
+      "label": null
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "filter": null,
+      "label": null
+    },
+    {
+      "from": 3,
+      "to": 4,
+      "filter": {
+        "name": "High Priority",
+        "conditions": [
+          [
+            {
+              "a": "{{2.priority}}",
+              "b": "high",
+              "o": "text:equal"
+            }
+          ]
+        ]
+      },
+      "label": "High Priority"
+    },
+    {
+      "from": 3,
+      "to": 5,
+      "filter": null,
+      "label": "All Events"
+    }
+  ],
+  "error_handling": {
+    "default_strategy": "ignore",
+    "max_errors": 5,
+    "module_overrides": []
+  },
+  "metadata": {
+    "created_at": "2026-02-17T04:25:02Z",
+    "updated_at": null,
+    "original_request": "Route incoming events: urgent ones go to Slack, all get logged to Google Sheets",
+    "agent_notes": [
+      "Router fallback route logs all events regardless of priority",
+      "Slack alert only fires for priority=high"
+    ],
+    "build_version": null
+  }
+}

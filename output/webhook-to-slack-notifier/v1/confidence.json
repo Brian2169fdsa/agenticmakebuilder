@@ -1,0 +1,12 @@
+{
+  "score": 0.98,
+  "factors": {
+    "validation_error_penalty": 0.0,
+    "warning_penalty": -0.0,
+    "assumption_penalty": -0.02,
+    "retry_penalty": -0.0,
+    "validation_pass_rate": 1.0
+  },
+  "grade": "A",
+  "explanation": "Score affected by: 1 assumption(s)."
+}

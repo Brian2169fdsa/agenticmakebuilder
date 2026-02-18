@@ -1,0 +1,275 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Agentic Make Builder Canonical Workflow Spec",
+  "description": "Normalized intermediate representation of a Make.com scenario. Version 1.0.0.",
+  "type": "object",
+  "required": ["spec_version", "scenario", "trigger", "modules", "connections", "error_handling", "metadata"],
+  "additionalProperties": false,
+  "properties": {
+
+    "spec_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of this schema (e.g., '1.0.0')."
+    },
+
+    "scenario": {
+      "type": "object",
+      "required": ["name", "description", "slug"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Human-readable scenario name."
+        },
+        "description": {
+          "type": "string",
+          "description": "What this scenario does."
+        },
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "description": "Kebab-case identifier for filesystem paths."
+        },
+        "scheduling": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["indefinitely", "once", "daily", "days", "specific"]
+            },
+            "interval": {
+              "type": "integer",
+              "minimum": 60,
+              "description": "Polling interval in seconds. Minimum 60."
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+
+    "trigger": {
+      "type": "object",
+      "required": ["id", "type", "module", "label"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "const": 1,
+          "description": "Trigger module ID. Always 1."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["webhook", "schedule", "app_event"]
+        },
+        "module": {
+          "type": "string",
+          "description": "Make.com module identifier from the curated registry."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable label."
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "credential_placeholder": {
+          "type": ["string", "null"],
+          "pattern": "^__[A-Z_]+_CONNECTION__$"
+        },
+        "webhook": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "data_structure": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "app", "module", "module_type"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 2,
+            "description": "Unique sequential module ID starting from 2."
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1
+          },
+          "app": {
+            "type": "string",
+            "description": "Application namespace."
+          },
+          "module": {
+            "type": "string",
+            "description": "Full Make.com module identifier (app:ModuleName)."
+          },
+          "module_type": {
+            "type": "string",
+            "enum": ["action", "search", "flow_control", "transformer", "aggregator", "iterator", "responder"]
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "parameters": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "mapper": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "credential_placeholder": {
+            "type": ["string", "null"],
+            "pattern": "^__[A-Z_]+_CONNECTION__$"
+          },
+          "onerror": {
+            "type": ["string", "null"],
+            "enum": ["ignore", "resume", "break", "rollback", "commit", null]
+          },
+          "resume_value": {
+            "type": ["object", "null"],
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+
+    "connections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from", "to"],
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "oneOf": [
+              { "type": "string", "const": "trigger" },
+              { "type": "integer", "minimum": 1 }
+            ],
+            "description": "Source: 'trigger' or integer module ID."
+          },
+          "to": {
+            "type": "integer",
+            "minimum": 2,
+            "description": "Target module ID."
+          },
+          "filter": {
+            "type": ["object", "null"],
+            "properties": {
+              "name": { "type": "string" },
+              "conditions": {
+                "type": "array",
+                "description": "2D array: outer=OR groups, inner=AND conditions.",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["a", "o"],
+                    "properties": {
+                      "a": { "type": "string", "description": "Left operand." },
+                      "b": { "type": "string", "description": "Right operand." },
+                      "o": { "type": "string", "description": "Operator (e.g., text:equal)." }
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "label": {
+            "type": ["string", "null"]
+          }
+        }
+      }
+    },
+
+    "error_handling": {
+      "type": "object",
+      "required": ["default_strategy"],
+      "additionalProperties": false,
+      "properties": {
+        "default_strategy": {
+          "type": "string",
+          "enum": ["ignore", "resume", "break", "rollback", "commit"]
+        },
+        "max_errors": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        },
+        "module_overrides": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["module_id", "strategy"],
+            "properties": {
+              "module_id": { "type": "integer" },
+              "strategy": {
+                "type": "string",
+                "enum": ["ignore", "resume", "break", "rollback", "commit"]
+              },
+              "resume_value": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+
+    "metadata": {
+      "type": "object",
+      "required": ["created_at", "original_request"],
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp."
+        },
+        "updated_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "original_request": {
+          "type": "string",
+          "minLength": 1
+        },
+        "agent_notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "build_version": {
+          "type": ["integer", "null"]
+        }
+      }
+    }
+  }
+}

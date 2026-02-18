@@ -1,0 +1,132 @@
+{
+  "name": "Priority Alert Router",
+  "flow": [
+    {
+      "id": 1,
+      "module": "gateway:CustomWebHook",
+      "version": 1,
+      "parameters": {
+        "hook": "__WEBHOOK_ID__"
+      },
+      "mapper": {},
+      "metadata": {
+        "designer": {
+          "x": 0,
+          "y": 0
+        }
+      }
+    },
+    {
+      "id": 2,
+      "module": "json:ParseJSON",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "json": "{{1.body}}"
+      },
+      "metadata": {
+        "designer": {
+          "x": 300,
+          "y": 0
+        }
+      }
+    },
+    {
+      "id": 3,
+      "module": "builtin:BasicRouter",
+      "version": 1,
+      "mapper": null,
+      "metadata": {
+        "designer": {
+          "x": 600,
+          "y": 0
+        }
+      },
+      "routes": [
+        {
+          "flow": [
+            {
+              "id": 4,
+              "module": "slack:PostMessage",
+              "version": 1,
+              "parameters": {
+                "__IMTCONN__": "__SLACK_CONNECTION__"
+              },
+              "mapper": {
+                "channel": "#urgent-alerts",
+                "text": "URGENT: {{2.title}} \u2014 {{2.description}}"
+              },
+              "metadata": {
+                "designer": {
+                  "x": 900,
+                  "y": -100
+                }
+              },
+              "onerror": [
+                {
+                  "directive": "break"
+                }
+              ],
+              "filter": {
+                "name": "High Priority",
+                "conditions": [
+                  [
+                    {
+                      "a": "{{2.priority}}",
+                      "b": "high",
+                      "o": "text:equal"
+                    }
+                  ]
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "flow": [
+            {
+              "id": 5,
+              "module": "google-sheets:addRow",
+              "version": 2,
+              "parameters": {
+                "spreadsheetId": "__SPREADSHEET_ID__",
+                "sheetId": "__SHEET_ID__",
+                "__IMTCONN__": "__GOOGLE_SHEETS_CONNECTION__"
+              },
+              "mapper": {
+                "values": [
+                  "{{2.timestamp}}",
+                  "{{2.priority}}",
+                  "{{2.title}}"
+                ]
+              },
+              "metadata": {
+                "designer": {
+                  "x": 900,
+                  "y": 100
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "version": 1,
+    "scenario": {
+      "roundtrips": 1,
+      "maxErrors": 5,
+      "autoCommit": true,
+      "autoCommitTriggerLast": true,
+      "sequential": false,
+      "confidential": false,
+      "dataloss": false,
+      "dlq": false,
+      "freshVariables": false
+    },
+    "designer": {
+      "orphans": []
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "spec_version": "1.0.0",
+  "scenario": {
+    "name": "Form Submission to Slack",
+    "description": "Receives form submission data via webhook, parses the JSON payload, and posts a notification to a Slack channel.",
+    "slug": "form-submission-to-slack"
+  },
+  "trigger": {
+    "id": 1,
+    "type": "webhook",
+    "module": "gateway:CustomWebHook",
+    "label": "Receive Form Submission",
+    "version": 1,
+    "parameters": {
+      "hook": "__WEBHOOK_ID__"
+    },
+    "credential_placeholder": null
+  },
+  "modules": [
+    {
+      "id": 2,
+      "label": "Parse Form Data",
+      "app": "json",
+      "module": "json:ParseJSON",
+      "module_type": "transformer",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "json": "{{1.body}}"
+      },
+      "credential_placeholder": null,
+      "onerror": null,
+      "resume_value": null
+    },
+    {
+      "id": 3,
+      "label": "Notify Team on Slack",
+      "app": "slack",
+      "module": "slack:PostMessage",
+      "module_type": "action",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "channel": "#form-submissions",
+        "text": "New submission from {{2.name}} ({{2.email}})"
+      },
+      "credential_placeholder": "__SLACK_CONNECTION__",
+      "onerror": "ignore",
+      "resume_value": null
+    }
+  ],
+  "connections": [
+    {
+      "from": "trigger",
+      "to": 2,
+      "filter": null,
+      "label": null
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "filter": null,
+      "label": null
+    }
+  ],
+  "error_handling": {
+    "default_strategy": "ignore",
+    "max_errors": 3,
+    "module_overrides": []
+  },
+  "metadata": {
+    "created_at": "2026-02-16T22:20:38Z",
+    "updated_at": null,
+    "original_request": "When someone submits a form, parse the data and notify the team on Slack",
+    "agent_notes": [
+      "Assumed webhook payload contains 'name' and 'email' fields",
+      "Slack channel #form-submissions must exist"
+    ],
+    "build_version": null
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "total_hours": 7.25,
+  "complexity_grade": "complex",
+  "breakdown": {
+    "base": 1.0,
+    "modules": 2.0,
+    "routers": 1.0,
+    "iterators_aggregators": 0.0,
+    "external_apps": 3.0,
+    "filtered_connections": 0.25
+  },
+  "phases": {
+    "design_and_planning": 1.09,
+    "module_configuration": 2.17,
+    "connection_and_routing": 1.09,
+    "credential_setup": 1.09,
+    "testing_and_validation": 1.45,
+    "documentation": 0.36
+  },
+  "notes": [
+    "Base setup: 1.0h",
+    "4 module(s): +2.0h",
+    "1 router(s): +1.0h (branching complexity)",
+    "2 external app(s) requiring auth: +3.0h",
+    "  - google-sheets: credential setup + testing",
+    "  - slack: credential setup + testing",
+    "1 filtered connection(s): +0.25h"
+  ]
+}
