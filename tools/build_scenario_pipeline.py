@@ -54,6 +54,7 @@ from tools.spec_version_manager import save_versioned_spec
 from tools.timeline_estimator import estimate_timeline
 from tools.cost_estimator import estimate_cost
 from tools.delivery_packager import package_delivery
+from tools.blueprint_generator import generate_blueprint
 from db.repo import create_build, store_artifact, finalize_build
 
 
@@ -261,6 +262,11 @@ def build_scenario_pipeline(plan, registry, original_request,
             with open(pack_path, "w") as f:
                 json.dump(delivery["pack_json"], f, indent=2, default=str)
 
+            generate_blueprint(
+                output_path=version_result["output_path"],
+                customer_name=spec.get("scenario_name", "Customer").split(":")[0].strip(),
+            )
+
             result["success"] = True
             result["delivery_summary"] = _build_success_summary(
                 result, spec, blueprint, confidence, timeline, cost
@@ -355,7 +361,6 @@ def _build_success_summary(result, spec, blueprint, confidence, timeline=None, c
             lines.append(f"- [{mod['id']}] {mod['label']} (`{mod['module']}`)")
         lines.append("")
 
-    # Timeline
     if timeline:
         lines.extend([
             "## Timeline Estimate",
@@ -365,7 +370,6 @@ def _build_success_summary(result, spec, blueprint, confidence, timeline=None, c
             "",
         ])
 
-    # Cost
     if cost:
         lines.extend([
             "## Cost Estimate",
@@ -389,6 +393,7 @@ def _build_success_summary(result, spec, blueprint, confidence, timeline=None, c
         "- `cost_estimate.json`",
         "- `customer_delivery_summary.md`",
         "- `delivery_pack.json`",
+        "- `build_blueprint.md`",
         "",
         f"## Confidence",
         "",
@@ -583,25 +588,23 @@ if __name__ == "__main__":
         assert r1["export_validation"]["valid"] is True
         assert r1["failure_reason"] is None
 
-        # Verify artifacts on disk (10 files)
         vdir = r1["output_path"]
         expected_files = [
             "canonical_spec.json", "make_export.json",
             "validation_report.json", "export_validation_report.json",
             "confidence.json", "build_log.md",
             "timeline.json", "cost_estimate.json",
-            "customer_delivery_summary.md", "delivery_pack.json"
+            "customer_delivery_summary.md", "delivery_pack.json",
+            "build_blueprint.md"
         ]
         for fname in expected_files:
             assert os.path.isfile(os.path.join(vdir, fname)), f"Missing: {fname}"
 
-        # Verify make_export.json is valid JSON
         with open(os.path.join(vdir, "make_export.json"), "r") as f:
             bp = json.load(f)
         assert "flow" in bp
         assert bp["name"] == "Form to Slack"
 
-        # Verify new CS artifacts
         with open(os.path.join(vdir, "timeline.json"), "r") as f:
             tl = json.load(f)
         assert tl["total_hours"] > 0
@@ -617,6 +620,7 @@ if __name__ == "__main__":
         assert dp["scenario"]["name"] == "Form to Slack"
 
         assert os.path.getsize(os.path.join(vdir, "customer_delivery_summary.md")) > 100
+        assert os.path.getsize(os.path.join(vdir, "build_blueprint.md")) > 100
 
         print(f"  Success: {r1['success']}")
         print(f"  Slug: {r1['slug']}, Version: v{r1['version']}")
@@ -624,9 +628,8 @@ if __name__ == "__main__":
         print(f"  Spec: {r1['canonical_validation']['checks_passed']}/{r1['canonical_validation']['checks_run']}")
         print(f"  Export: {r1['export_validation']['checks_passed']}/{r1['export_validation']['checks_run']}")
         print(f"  Artifacts: {len(expected_files)} files in {vdir}")
-        print("  [OK] Linear build passes with all CS delivery artifacts")
+        print("  [OK] Linear build passes with all delivery artifacts including blueprint")
 
-        # --- Test 2: Successful router build ---
         print("\nTest 2: Successful router build")
         plan2 = {
             "scenario_name": "Priority Router",
@@ -683,7 +686,6 @@ if __name__ == "__main__":
         print(f"  Confidence: {r2['confidence']['score']} ({r2['confidence']['grade']})")
         print("  [OK] Router build passes")
 
-        # --- Test 3: Version increment ---
         print("\nTest 3: Version increment (same slug, build again)")
         r3 = build_scenario_pipeline(
             plan1, registry, "Post form data to Slack v2",
@@ -695,7 +697,6 @@ if __name__ == "__main__":
         print(f"  Version: v{r3['version']}")
         print("  [OK] Version auto-incremented")
 
-        # --- Test 4: Canonical validation failure stops pipeline ---
         print("\nTest 4: Canonical validation failure")
         bad_plan = {
             "scenario_name": "Bad Plan",
@@ -729,7 +730,6 @@ if __name__ == "__main__":
         print(f"  Reason: {r4['failure_reason'][:80]}...")
         print("  [OK] Pipeline stopped on canonical validation failure")
 
-        # --- Test 5: Deep copy safety (input not mutated) ---
         print("\nTest 5: Input not mutated")
         plan_copy = copy.deepcopy(plan1)
         _ = build_scenario_pipeline(
@@ -739,7 +739,6 @@ if __name__ == "__main__":
         assert plan1 == plan_copy, "Input plan was mutated!"
         print("  [OK] Original plan unchanged")
 
-        # --- Test 6: Determinism ---
         print("\nTest 6: Determinism")
         det_dir1 = tempfile.mkdtemp(prefix="amb_det1_")
         det_dir2 = tempfile.mkdtemp(prefix="amb_det2_")
@@ -759,7 +758,6 @@ if __name__ == "__main__":
         assert r6a["canonical_validation"] == r6b["canonical_validation"]
         assert r6a["export_validation"] == r6b["export_validation"]
 
-        # Verify make_export.json content is identical
         with open(os.path.join(r6a["output_path"], "make_export.json")) as f:
             bp_a = json.load(f)
         with open(os.path.join(r6b["output_path"], "make_export.json")) as f:
@@ -770,7 +768,6 @@ if __name__ == "__main__":
         shutil.rmtree(det_dir2)
         print("  [OK] Deterministic (same plan → same output)")
 
-        # --- Test 7: Delivery summary content ---
         print("\nTest 7: Delivery summary")
         summary = r1["delivery_summary"]
         assert "# Build Complete" in summary
@@ -782,16 +779,16 @@ if __name__ == "__main__":
         assert "cost_estimate.json" in summary
         assert "customer_delivery_summary.md" in summary
         assert "delivery_pack.json" in summary
+        assert "build_blueprint.md" in summary
         assert "Timeline Estimate" in summary
         assert "Cost Estimate" in summary
-        print("  [OK] Success summary contains expected sections (including CS artifacts)")
+        print("  [OK] Success summary contains all expected sections")
 
         summary_fail = r4["delivery_summary"]
         assert "# Build Failed" in summary_fail
         assert r4["failure_reason"][:30] in summary_fail
         print("  [OK] Failure summary contains reason")
 
-        # --- Test 8: Global index updated ---
         print("\nTest 8: Global index")
         with open(os.path.join(test_dir, "index.json")) as f:
             global_idx = json.load(f)

@@ -1,6 +1,5 @@
 """
 SQLAlchemy ORM Models
-
 Maps to the PostgreSQL schema in db/schema.sql.
 Tables: projects, builds, build_artifacts, assumptions.
 All enum-like columns use plain TEXT — no PostgreSQL enum types.

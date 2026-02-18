@@ -1,0 +1,26 @@
+{
+  "total_hours": 3.5,
+  "complexity_grade": "simple",
+  "breakdown": {
+    "base": 1.0,
+    "modules": 1.0,
+    "routers": 0.0,
+    "iterators_aggregators": 0.0,
+    "external_apps": 1.5,
+    "filtered_connections": 0.0
+  },
+  "phases": {
+    "design_and_planning": 0.53,
+    "module_configuration": 1.05,
+    "connection_and_routing": 0.53,
+    "credential_setup": 0.53,
+    "testing_and_validation": 0.7,
+    "documentation": 0.18
+  },
+  "notes": [
+    "Base setup: 1.0h",
+    "2 module(s): +1.0h",
+    "1 external app(s) requiring auth: +1.5h",
+    "  - slack: credential setup + testing"
+  ]
+}

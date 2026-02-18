@@ -6,9 +6,11 @@ Provides get_db() generator for FastAPI Depends injection.
 """
 
 import os
-
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+
+load_dotenv()
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",

@@ -1,0 +1,81 @@
+{
+  "delivery_version": "1.0.0",
+  "scenario": {
+    "name": "Acme Corp: Form submission notifications to Slack",
+    "slug": "acme-corp-form-submission-notifications-to-slack",
+    "description": "Automatically notify team on Slack when a web form is submitted",
+    "version": 1,
+    "output_path": "/Users/brianreinhart/Desktop/agenticmakebuilder/output/acme-corp-form-submission-notifications-to-slack/v1"
+  },
+  "structure": {
+    "trigger": {
+      "type": "webhook",
+      "module": "gateway:CustomWebHook",
+      "label": "Incoming form submission webhook"
+    },
+    "module_count": 2,
+    "connection_count": 2,
+    "apps_used": [
+      "gateway",
+      "json",
+      "slack"
+    ],
+    "has_routing": false,
+    "has_iteration": false,
+    "credentials_required": [
+      "__SLACK_CONNECTION__"
+    ]
+  },
+  "quality": {
+    "confidence_score": 0.96,
+    "confidence_grade": "A",
+    "canonical_validation": {
+      "valid": true,
+      "checks_run": 48,
+      "checks_passed": 48,
+      "errors": 0,
+      "warnings": 0,
+      "error_details": []
+    },
+    "export_validation": {
+      "valid": true,
+      "checks_run": 43,
+      "checks_passed": 43,
+      "errors": 0,
+      "warnings": 0,
+      "error_details": []
+    },
+    "self_healed": false
+  },
+  "timeline": {
+    "total_hours": 3.5,
+    "complexity_grade": "simple",
+    "phases": {
+      "design_and_planning": 0.53,
+      "module_configuration": 1.05,
+      "connection_and_routing": 0.53,
+      "credential_setup": 0.53,
+      "testing_and_validation": 0.7,
+      "documentation": 0.18
+    }
+  },
+  "cost": {
+    "ops_per_execution": 3,
+    "ops_per_month": 300,
+    "recommended_plan": "Free",
+    "monthly_cost": 0.0,
+    "annual_estimate": 0.0
+  },
+  "artifacts": [
+    "make_export.json",
+    "canonical_spec.json",
+    "validation_report.json",
+    "export_validation_report.json",
+    "confidence.json",
+    "timeline.json",
+    "cost_estimate.json",
+    "customer_delivery_summary.md",
+    "delivery_pack.json",
+    "build_log.md"
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "spec_version": "1.0.0",
+  "scenario": {
+    "name": "Acme Corp: Form submission notifications to Slack",
+    "description": "Automatically notify team on Slack when a web form is submitted",
+    "slug": "acme-corp-form-submission-notifications-to-slack"
+  },
+  "trigger": {
+    "id": 1,
+    "type": "webhook",
+    "module": "gateway:CustomWebHook",
+    "label": "Incoming form submission webhook",
+    "version": 1,
+    "parameters": {
+      "hook": "__WEBHOOK_ID__"
+    },
+    "credential_placeholder": null
+  },
+  "modules": [
+    {
+      "id": 2,
+      "label": "Parse the incoming JSON payload",
+      "app": "json",
+      "module": "json:ParseJSON",
+      "module_type": "transformer",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "json": "{{1.body}}"
+      },
+      "credential_placeholder": null,
+      "onerror": null,
+      "resume_value": null
+    },
+    {
+      "id": 3,
+      "label": "Post notification to Slack channel",
+      "app": "slack",
+      "module": "slack:PostMessage",
+      "module_type": "action",
+      "version": 1,
+      "parameters": {},
+      "mapper": {
+        "channel": "#notifications",
+        "text": "{{2.value}}"
+      },
+      "credential_placeholder": "__SLACK_CONNECTION__",
+      "onerror": null,
+      "resume_value": null
+    }
+  ],
+  "connections": [
+    {
+      "from": "trigger",
+      "to": 2,
+      "filter": null,
+      "label": null
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "filter": null,
+      "label": null
+    }
+  ],
+  "error_handling": {
+    "default_strategy": "ignore",
+    "max_errors": 3,
+    "module_overrides": []
+  },
+  "metadata": {
+    "created_at": "2026-02-18T05:36:26Z",
+    "updated_at": null,
+    "original_request": "When a form is submitted, notify the team in Slack",
+    "agent_notes": [
+      "Auto-resolved 'Parse the incoming JSON payload' \u2192 json:ParseJSON",
+      "Auto-resolved 'Post notification to Slack channel' \u2192 slack:PostMessage"
+    ],
+    "build_version": null
+  }
+}
