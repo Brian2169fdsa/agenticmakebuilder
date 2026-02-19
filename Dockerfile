@@ -10,4 +10,6 @@ COPY . .
 
 ENV PORT=8000
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
+EXPOSE ${PORT}
+
+CMD sh -c "uvicorn app:app --host 0.0.0.0 --port ${PORT}"
