@@ -37,6 +37,10 @@ def get_db():
 
 
 def check_db():
-    """Verify database connectivity. Raises on failure."""
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
+    """Verify database connectivity. Logs warning on failure instead of crashing."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("✓ Database connected")
+    except Exception as e:
+        print(f"⚠ Database not reachable (app will still start): {e}")
