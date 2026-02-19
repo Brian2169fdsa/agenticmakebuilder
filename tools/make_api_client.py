@@ -39,9 +39,9 @@ class MakeAPIClient:
     """
 
     def __init__(self, api_key: str = None, team_id: int = None, base_url: str = None):
-        self.api_key = api_key or os.environ.get("MAKE_API_KEY", "")
-        self.team_id = team_id or int(os.environ.get("MAKE_TEAM_ID", "0"))
-        self.base_url = (base_url or MAKE_API_BASE).rstrip("/")
+        self.api_key = api_key if api_key is not None else os.environ.get("MAKE_API_KEY", "")
+        self.team_id = team_id if team_id is not None else int(os.environ.get("MAKE_TEAM_ID", "0"))
+        self.base_url = (base_url if base_url is not None else MAKE_API_BASE).rstrip("/")
 
     def _request(self, method: str, path: str, body: dict = None) -> dict:
         url = f"{self.base_url}{path}"
