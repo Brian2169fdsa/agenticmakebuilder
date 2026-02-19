@@ -187,7 +187,11 @@ def generate_delivery_assessment(intake, registry):
     resolved_steps = []
     non_registry_apps = set()
 
-    for i, step in enumerate(intake.get("processing_steps", [])):
+    for i, step in enumerate(intake.get("processing_steps") or []):
+        # Normalize plain strings into step dicts
+        if isinstance(step, str):
+            step = {"description": step, "app": None, "module": None}
+
         desc = step.get("description", "")
         app = step.get("app")
         module = step.get("module")
@@ -254,7 +258,7 @@ def generate_delivery_assessment(intake, registry):
         )
 
     # === Phase E: Routing validation ===
-    routing = intake.get("routing", {})
+    routing = intake.get("routing") or {}
     if routing.get("needed") and not routing.get("conditions"):
         questions.append(
             "Routing is needed but no conditions were specified. "
@@ -325,9 +329,9 @@ def _build_delivery_report(intake, resolved_steps, risks, assumptions, registry_
         mod = step.get("_resolved_module", "unknown")
         scope.append(f"Step {i+1}: {step.get('description', '')} ({mod})")
 
-    routing = intake.get("routing", {})
+    routing = intake.get("routing") or {}
     if routing.get("needed"):
-        conditions = routing.get("conditions", [])
+        conditions = routing.get("conditions") or []
         scope.append(f"Configure router with {len(conditions)} routing condition(s)")
 
     for app in sorted(cred_apps):
@@ -351,7 +355,7 @@ def _build_delivery_report(intake, resolved_steps, risks, assumptions, registry_
         )
 
     # Cost assumptions
-    freq = intake.get("estimated_frequency", "100 executions/month")
+    freq = intake.get("estimated_frequency") or "100 executions/month"
     cost_assumptions = [
         f"Estimated execution frequency: {freq}",
         "Standard Make.com pricing applies",
@@ -373,7 +377,7 @@ def _build_delivery_report(intake, resolved_steps, risks, assumptions, registry_
         "assumptions": assumptions,
         "timeline_assumptions": timeline_assumptions,
         "cost_assumptions": cost_assumptions,
-        "expected_outputs": intake.get("expected_outputs", [])
+        "expected_outputs": intake.get("expected_outputs") or []
     }
 
 
@@ -397,7 +401,7 @@ def _build_plan_dict(intake, resolved_steps, modules_dict):
 
     # Build steps
     steps = []
-    routing = intake.get("routing", {})
+    routing = intake.get("routing") or {}
     has_router = routing.get("needed", False)
     router_step_index = None
 
@@ -460,7 +464,7 @@ def _build_plan_dict(intake, resolved_steps, modules_dict):
             pass  # trigger → 0 already added
 
         # Router → each branch step
-        conditions = routing.get("conditions", [])
+        conditions = routing.get("conditions") or []
         branch_steps = list(range(router_step_index + 1, len(steps)))
 
         for bi, branch_idx in enumerate(branch_steps):
@@ -482,7 +486,7 @@ def _build_plan_dict(intake, resolved_steps, modules_dict):
             connections.append(conn)
 
     # Error handling
-    eh_pref = intake.get("error_handling_preference", "ignore") or "ignore"
+    eh_pref = intake.get("error_handling_preference") or "ignore"
     error_handling = {
         "default_strategy": eh_pref,
         "max_errors": 3
