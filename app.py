@@ -4210,3 +4210,106 @@ def confidence_trend(project_id: str = Query(...), db: Session = Depends(get_db)
         "first_score": first_score,
         "total_runs": len(entries),
     }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SPRINT 6 — ADMIN CONTROL PLANE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+# ── POST /admin/reset-project ───────────────────────────────────
+
+
+class AdminResetRequest(BaseModel):
+    project_id: str
+    target_stage: Optional[str] = "intake"
+
+
+@app.post("/admin/reset-project")
+def admin_reset_project(request: AdminResetRequest, db: Session = Depends(get_db)):
+    """
+    Reset a project's pipeline state to a target stage (default: intake).
+
+    Clears current agent assignment and logs the reset in stage_history
+    and Supabase activity.
+    """
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    target = request.target_stage.lower().strip()
+    if target not in _STAGE_ORDER:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid target_stage '{target}'. Must be one of: {', '.join(_STAGE_ORDER)}",
+        )
+
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    now = datetime.now(timezone.utc)
+    new_agent = _STAGE_AGENT_MAP.get(target, "supervisor")
+
+    state = db.query(ProjectAgentState).filter(
+        ProjectAgentState.project_id == project_uuid
+    ).first()
+
+    if state:
+        old_stage = state.current_stage
+        state.current_stage = target
+        state.current_agent = new_agent
+        state.updated_at = now
+        state.pipeline_health = "on_track"
+        history = state.stage_history or []
+        history.append({
+            "stage": target,
+            "agent": new_agent,
+            "started_at": now.isoformat(),
+            "reset_from": old_stage,
+            "action": "admin_reset",
+        })
+        state.stage_history = history
+    else:
+        state = ProjectAgentState(
+            project_id=project_uuid,
+            current_stage=target,
+            current_agent=new_agent,
+            started_at=now,
+            updated_at=now,
+            pipeline_health="on_track",
+            stage_history=[{
+                "stage": target,
+                "agent": new_agent,
+                "started_at": now.isoformat(),
+                "action": "admin_reset",
+            }],
+        )
+        db.add(state)
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Reset failed: {str(e)}")
+
+    # Sync to Supabase
+    try:
+        from tools.pipeline_sync import sync_project_state, sync_activity
+        sync_project_state(str(project_uuid), target, new_agent)
+        sync_activity(
+            project_id=str(project_uuid),
+            action_type="admin_reset",
+            description=f"Project reset to {target} by admin",
+            agent_name="admin",
+        )
+    except Exception:
+        pass
+
+    return {
+        "project_id": str(project_uuid),
+        "reset_to": target,
+        "new_agent": new_agent,
+        "reset_at": now.isoformat(),
+    }
