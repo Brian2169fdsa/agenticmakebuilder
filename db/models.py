@@ -169,6 +169,111 @@ class ProjectFinancial(Base):
     )
 
 
+class ProjectAgentState(Base):
+    __tablename__ = "project_agent_state"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    current_stage = Column(Text, nullable=False, default="intake")
+    current_agent = Column(Text)
+    started_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    pipeline_health = Column(Text, nullable=False, default="on_track")
+    stage_history = Column(JSONB, default=list)
+
+    project = relationship("Project")
+
+
+class ClientContext(Base):
+    __tablename__ = "client_context"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_id = Column(Text, nullable=False)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    key_decisions = Column(JSONB)
+    tech_stack = Column(JSONB)
+    failure_patterns = Column(JSONB)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    project = relationship("Project")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id", "project_id",
+            name="uq_client_context_client_project",
+        ),
+    )
+
+
+class VerificationRun(Base):
+    __tablename__ = "verification_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    confidence_score = Column(Float, nullable=False)
+    passed = Column(Boolean, nullable=False)
+    error_count = Column(Integer, nullable=False, default=0)
+    warning_count = Column(Integer, nullable=False, default=0)
+    fix_instructions = Column(JSONB)
+    iteration = Column(Integer, nullable=False, default=1)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    project = relationship("Project")
+
+
+class Deployment(Base):
+    __tablename__ = "deployments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target = Column(Text, nullable=False)
+    external_id = Column(Text)
+    external_url = Column(Text)
+    status = Column(Text, nullable=False, default="pending")
+    last_health_check = Column(JSONB)
+    deployed_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    project = relationship("Project")
+
+
 class PersonaClientContext(Base):
     __tablename__ = "persona_client_context"
 

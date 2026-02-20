@@ -38,7 +38,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from db.session import get_db, check_db
-from db.models import AgentHandoff, ProjectFinancial, Project, PersonaClientContext, PersonaFeedback
+from db.models import (
+    AgentHandoff, ProjectFinancial, Project, PersonaClientContext, PersonaFeedback,
+    ProjectAgentState, ClientContext, VerificationRun, Deployment,
+)
 from tools.module_registry_loader import load_module_registry
 from tools.build_scenario_pipeline import build_scenario_pipeline
 from tools.generate_delivery_assessment import generate_delivery_assessment
@@ -1071,6 +1074,169 @@ def costs_summary(client_id: str = Query(..., description="Customer name or proj
             "total_output_tokens": total_output_tokens,
         },
         "projects": projects,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# BLOCK 1 — MULTI-AGENT ORCHESTRATION
+# ═══════════════════════════════════════════════════════════════
+
+# Pipeline stage → agent mapping
+_STAGE_AGENT_MAP = {
+    "intake": "assessor",
+    "build": "builder",
+    "verify": "validator",
+    "deploy": "deployer",
+}
+_STAGE_ORDER = ["intake", "build", "verify", "deploy"]
+
+
+class OrchestrateRequest(BaseModel):
+    project_id: str
+    current_stage: str  # intake | build | verify | deploy
+
+
+class AgentCompleteRequest(BaseModel):
+    project_id: str
+    agent_name: str
+    outcome: str  # success | failed | needs_review
+    artifacts: Optional[dict] = None
+
+
+class MemoryRequest(BaseModel):
+    client_id: str
+    project_id: str
+    key_decisions: Optional[list] = None
+    tech_stack: Optional[list] = None
+    failure_patterns: Optional[list] = None
+
+
+class VerifyLoopRequest(BaseModel):
+    project_id: str
+    blueprint: dict
+    max_iterations: Optional[int] = 3
+
+
+class DeployMakecomRequest(BaseModel):
+    project_id: str
+    blueprint: dict
+    api_key: str
+    team_id: Optional[int] = None
+
+
+class DeployN8nRequest(BaseModel):
+    project_id: str
+    workflow: dict
+    n8n_url: str
+    api_key: str
+
+
+class CostEstimateRequest(BaseModel):
+    description: str
+    category: Optional[str] = "standard"
+
+
+class CommandRequest(BaseModel):
+    command: str
+    customer_name: Optional[str] = None
+
+
+@app.post("/orchestrate")
+def orchestrate(request: OrchestrateRequest, db: Session = Depends(get_db)):
+    """
+    Determine next agent for a project and advance the pipeline.
+
+    Accepts project_id and current_stage. Looks up or creates the pipeline
+    state, determines the next agent, updates project_agent_state, and
+    returns next_agent + context_bundle.
+    """
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    stage = request.current_stage.lower().strip()
+    if stage not in _STAGE_AGENT_MAP:
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid stage '{stage}'. Must be one of: {', '.join(_STAGE_ORDER)}")
+
+    next_agent = _STAGE_AGENT_MAP[stage]
+
+    # Determine next stage after current
+    stage_idx = _STAGE_ORDER.index(stage)
+    next_stage = _STAGE_ORDER[stage_idx + 1] if stage_idx < len(_STAGE_ORDER) - 1 else None
+
+    # Upsert pipeline state
+    state = db.query(ProjectAgentState).filter(
+        ProjectAgentState.project_id == project_uuid
+    ).first()
+
+    now = datetime.now(timezone.utc)
+    stage_entry = {"stage": stage, "agent": next_agent, "started_at": now.isoformat()}
+
+    if state:
+        state.current_stage = stage
+        state.current_agent = next_agent
+        state.updated_at = now
+        state.pipeline_health = "on_track"
+        history = state.stage_history or []
+        history.append(stage_entry)
+        state.stage_history = history
+    else:
+        state = ProjectAgentState(
+            project_id=project_uuid,
+            current_stage=stage,
+            current_agent=next_agent,
+            started_at=now,
+            updated_at=now,
+            pipeline_health="on_track",
+            stage_history=[stage_entry],
+        )
+        db.add(state)
+
+    # Build context bundle from latest handoffs and builds
+    context_bundle = {
+        "project_id": str(project_uuid),
+        "project_name": project.name,
+        "customer_name": project.customer_name,
+        "current_stage": stage,
+        "assigned_agent": next_agent,
+        "next_stage": next_stage,
+    }
+
+    # Include latest build info if available
+    latest_build = db.execute(text("""
+        SELECT slug, version, status, confidence_score, confidence_grade
+        FROM builds WHERE project_id = :pid
+        ORDER BY created_at DESC LIMIT 1
+    """), {"pid": str(project_uuid)}).fetchone()
+
+    if latest_build:
+        context_bundle["latest_build"] = {
+            "slug": latest_build.slug,
+            "version": latest_build.version,
+            "status": latest_build.status,
+            "confidence_score": latest_build.confidence_score,
+            "confidence_grade": latest_build.confidence_grade,
+        }
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update pipeline state: {str(e)}")
+
+    return {
+        "project_id": str(project_uuid),
+        "current_stage": stage,
+        "next_agent": next_agent,
+        "next_stage": next_stage,
+        "pipeline_health": "on_track",
+        "context_bundle": context_bundle,
     }
 
 

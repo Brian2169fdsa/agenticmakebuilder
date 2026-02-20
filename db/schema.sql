@@ -191,6 +191,69 @@ CREATE TABLE IF NOT EXISTS project_financials (
 
 CREATE INDEX IF NOT EXISTS idx_financials_project ON project_financials(project_id, created_at DESC);
 
+-- ── Project agent state (orchestration pipeline) ────────────
+
+CREATE TABLE IF NOT EXISTS project_agent_state (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE UNIQUE,
+    current_stage TEXT NOT NULL DEFAULT 'intake',
+    current_agent TEXT,
+    started_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    pipeline_health TEXT NOT NULL DEFAULT 'on_track',
+    stage_history JSONB DEFAULT '[]'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_state_project ON project_agent_state(project_id);
+CREATE INDEX IF NOT EXISTS idx_agent_state_health ON project_agent_state(pipeline_health);
+
+-- ── Client context (agent memory & learning) ────────────────
+
+CREATE TABLE IF NOT EXISTS client_context (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_id TEXT NOT NULL,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    key_decisions JSONB,
+    tech_stack JSONB,
+    failure_patterns JSONB,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(client_id, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_client_context_client ON client_context(client_id);
+
+-- ── Verification runs (confidence history) ──────────────────
+
+CREATE TABLE IF NOT EXISTS verification_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    confidence_score FLOAT NOT NULL,
+    passed BOOLEAN NOT NULL,
+    error_count INTEGER DEFAULT 0,
+    warning_count INTEGER DEFAULT 0,
+    fix_instructions JSONB,
+    iteration INTEGER DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_project ON verification_runs(project_id, created_at DESC);
+
+-- ── Deployments ─────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS deployments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    target TEXT NOT NULL,
+    external_id TEXT,
+    external_url TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_health_check JSONB,
+    deployed_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployments_project ON deployments(project_id);
+
 -- ── Persona client context (persona-builder service) ────────
 
 CREATE TABLE IF NOT EXISTS persona_client_context (
