@@ -1337,6 +1337,81 @@ def agent_complete(request: AgentCompleteRequest, db: Session = Depends(get_db))
     }
 
 
+@app.get("/pipeline/status")
+def pipeline_status(project_id: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Full pipeline state for a project: current_agent, completed stages with
+    timestamps, artifacts per stage, overall health (on_track/stalled/failed).
+    """
+    try:
+        project_uuid = UUID(project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    state = db.query(ProjectAgentState).filter(
+        ProjectAgentState.project_id == project_uuid
+    ).first()
+
+    # Get all handoffs for this project
+    handoffs = db.execute(text("""
+        SELECT from_agent, to_agent, context_bundle, created_at
+        FROM agent_handoffs
+        WHERE project_id = :pid
+        ORDER BY created_at ASC
+    """), {"pid": str(project_uuid)}).fetchall()
+
+    # Get artifacts
+    artifacts = db.execute(text("""
+        SELECT ba.artifact_type, ba.created_at, b.slug, b.version
+        FROM build_artifacts ba
+        JOIN builds b ON b.id = ba.build_id
+        WHERE b.project_id = :pid
+        ORDER BY ba.created_at DESC
+    """), {"pid": str(project_uuid)}).fetchall()
+
+    # Check for stalled state
+    health = "no_pipeline"
+    if state:
+        health = state.pipeline_health
+        hours_since_update = (datetime.now(timezone.utc) - state.updated_at).total_seconds() / 3600
+        if health == "on_track" and hours_since_update > 48:
+            health = "stalled"
+
+    return {
+        "project_id": str(project_uuid),
+        "project_name": project.name,
+        "customer_name": project.customer_name,
+        "current_stage": state.current_stage if state else None,
+        "current_agent": state.current_agent if state else None,
+        "pipeline_health": health,
+        "started_at": state.started_at.isoformat() if state else None,
+        "last_updated": state.updated_at.isoformat() if state else None,
+        "stage_history": state.stage_history if state else [],
+        "handoffs": [
+            {
+                "from_agent": h.from_agent,
+                "to_agent": h.to_agent,
+                "context": h.context_bundle,
+                "at": h.created_at.isoformat(),
+            }
+            for h in handoffs
+        ],
+        "artifacts": [
+            {
+                "type": a.artifact_type,
+                "slug": a.slug,
+                "version": a.version,
+                "created_at": a.created_at.isoformat(),
+            }
+            for a in artifacts[:20]
+        ],
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
