@@ -43,5 +43,20 @@ def check_db():
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         print("✓ Database connected")
+        _run_migrations()
     except Exception as e:
         print(f"⚠ Database not reachable (app will still start): {e}")
+
+
+def _run_migrations():
+    """Apply lightweight schema migrations (idempotent)."""
+    migrations = [
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS customer_name TEXT DEFAULT 'Unknown'",
+    ]
+    try:
+        with engine.begin() as conn:
+            for sql in migrations:
+                conn.execute(text(sql))
+        print("✓ Migrations applied")
+    except Exception as e:
+        print(f"⚠ Migration warning (non-fatal): {e}")
