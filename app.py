@@ -413,13 +413,27 @@ def assess(request: AssessRequest):
 
 
 @app.post("/plan")
-def plan(request: AssessRequest, db: Session = Depends(get_db)):
+def plan(
+    request: AssessRequest,
+    db: Session = Depends(get_db),
+    async_mode: bool = Query(False),
+):
     """
     Full pipeline: assess → build → 11 artifacts.
     Now enriched with similar past projects and client memory context.
+    Pass ?async_mode=true to enqueue as a background job.
     Returns 422 if assessment is incomplete or confidence is too low.
     Returns 500 on pipeline exception.
     """
+    if async_mode:
+        from tools.job_queue import enqueue_job
+        job_id = enqueue_job(
+            job_type="plan",
+            payload=request.model_dump(),
+            project_id=None,
+        )
+        return {"job_id": job_id, "status": "pending", "poll_url": f"/jobs/{job_id}"}
+
     from tools.embedding_engine import find_similar
 
     intake = request.model_dump()
