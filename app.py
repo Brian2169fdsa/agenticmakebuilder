@@ -1626,6 +1626,70 @@ def memory_get(client_id: str = Query(...), db: Session = Depends(get_db)):
     }
 
 
+class EmbedRequest(BaseModel):
+    project_id: str
+    brief: str
+    outcome: Optional[str] = None
+
+
+@app.post("/memory/embed")
+def memory_embed(request: EmbedRequest, db: Session = Depends(get_db)):
+    """
+    Embed a completed build brief + outcome into TF-IDF vector store.
+    Auto-called when a project is marked complete.
+    """
+    from tools.embedding_engine import embed_document
+
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    full_text = request.brief
+    if request.outcome:
+        full_text += f" OUTCOME: {request.outcome}"
+
+    result = embed_document(
+        doc_id=str(project_uuid),
+        text=full_text,
+        metadata={
+            "project_name": project.name,
+            "customer_name": project.customer_name,
+            "outcome": request.outcome,
+        },
+    )
+
+    return result
+
+
+@app.get("/similar")
+def similar(description: str = Query(..., min_length=3), top_n: int = Query(3, ge=1, le=10)):
+    """
+    Find top N similar past projects by cosine similarity over TF-IDF vectors.
+    Returns project_id, score, and brief_summary.
+    """
+    from tools.embedding_engine import find_similar
+
+    results = find_similar(description, top_n=top_n)
+
+    return {
+        "query": description,
+        "results": [
+            {
+                "project_id": r["id"],
+                "score": r["score"],
+                "brief_summary": r["text_preview"],
+                "metadata": r["metadata"],
+            }
+            for r in results
+        ],
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
