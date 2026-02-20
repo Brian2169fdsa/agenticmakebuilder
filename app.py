@@ -4020,3 +4020,112 @@ def briefing_daily(db: Session = Depends(get_db)):
         pass
 
     return briefing
+
+
+# ── POST /verify/auto ───────────────────────────────────────────
+
+
+class VerifyAutoRequest(BaseModel):
+    project_id: str
+    blueprint: dict
+
+
+@app.post("/verify/auto")
+def verify_auto(request: VerifyAutoRequest, db: Session = Depends(get_db)):
+    """
+    Auto-verify a blueprint and advance pipeline if confidence >= 85.
+
+    Runs the same validation as POST /verify. If passed, auto-advances
+    the project from verify to deploy stage. Returns whether auto_advanced.
+    """
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    if not request.blueprint or not isinstance(request.blueprint, dict):
+        raise HTTPException(status_code=400, detail="blueprint must be a non-empty JSON object")
+
+    # Run validation (same as /verify)
+    try:
+        export_report = validate_make_export(request.blueprint, _registry)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export validation failed: {str(e)}")
+
+    canonical_report = _run_supplementary_checks(request.blueprint, _registry)
+
+    all_errors = export_report.get("errors", []) + canonical_report.get("errors", [])
+    all_warnings = export_report.get("warnings", []) + canonical_report.get("warnings", [])
+    merged_report = {
+        "errors": all_errors,
+        "warnings": all_warnings,
+        "checks_run": export_report.get("checks_run", 0) + canonical_report.get("checks_run", 0),
+        "checks_passed": export_report.get("checks_passed", 0) + canonical_report.get("checks_passed", 0),
+    }
+
+    confidence = compute_confidence(merged_report, agent_notes=[], retry_count=0)
+    score_100 = round(confidence["score"] * 100, 1)
+    passed = score_100 >= 85 and len(all_errors) == 0
+
+    fix_instructions = []
+    if not passed:
+        fix_instructions = _generate_fix_instructions(all_errors, all_warnings, score_100)
+
+    # Log verification run
+    try:
+        run = VerificationRun(
+            project_id=project_uuid,
+            confidence_score=score_100,
+            passed=passed,
+            error_count=len(all_errors),
+            warning_count=len(all_warnings),
+            fix_instructions=fix_instructions if fix_instructions else None,
+        )
+        db.add(run)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    # Auto-advance if passed
+    auto_advanced = False
+    next_stage = None
+    if passed:
+        try:
+            state = db.query(ProjectAgentState).filter(
+                ProjectAgentState.project_id == project_uuid
+            ).first()
+            if state and state.current_stage in ("verify", "build"):
+                now = datetime.now(timezone.utc)
+                old_stage = state.current_stage
+                state.current_stage = "deploy"
+                state.current_agent = "deployer"
+                state.updated_at = now
+                history = state.stage_history or []
+                history.append({
+                    "stage": "deploy",
+                    "agent": "deployer",
+                    "started_at": now.isoformat(),
+                    "auto_advanced_from": old_stage,
+                    "confidence_score": score_100,
+                })
+                state.stage_history = history
+                db.commit()
+                auto_advanced = True
+                next_stage = "deploy"
+        except Exception:
+            db.rollback()
+
+    result = {
+        "project_id": request.project_id,
+        "confidence_score": score_100,
+        "grade": confidence["grade"],
+        "passed": passed,
+        "auto_advanced": auto_advanced,
+        "fix_instructions": fix_instructions,
+        "error_count": len(all_errors),
+        "warning_count": len(all_warnings),
+    }
+    if next_stage:
+        result["next_stage"] = next_stage
+
+    return result
