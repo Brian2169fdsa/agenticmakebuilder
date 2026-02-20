@@ -3903,3 +3903,120 @@ def pipeline_dashboard(db: Session = Depends(get_db)):
     summary = {s: len(projects) for s, projects in stages.items()}
 
     return {"stages": stages, "summary": summary, "total_projects": len(rows)}
+
+
+# ── POST /briefing/daily ────────────────────────────────────────
+
+
+@app.post("/briefing/daily")
+def briefing_daily(db: Session = Depends(get_db)):
+    """
+    Comprehensive daily briefing combining stalled projects, pipeline
+    summary, cost summary, alerts, and recommendations.
+
+    Saves to daily_briefings table via Supabase REST if configured.
+    Falls back gracefully if SUPABASE_URL not set.
+    """
+    now = datetime.now(timezone.utc)
+
+    # ── Stalled projects (reuse /supervisor/stalled logic) ─────
+    try:
+        stalled_rows = db.execute(text("""
+            SELECT p.id, p.name, COALESCE(p.customer_name, 'Unknown') AS client,
+                   p.status, p.updated_at,
+                   EXTRACT(EPOCH FROM (now() - p.updated_at)) / 3600 AS hours_stalled
+            FROM projects p
+            WHERE p.updated_at < now() - interval '48 hours'
+              AND p.status NOT IN ('deployed', 'cancelled')
+            ORDER BY p.updated_at ASC
+        """)).fetchall()
+    except Exception:
+        stalled_rows = []
+
+    stalled_projects = [
+        {
+            "project_id": str(r.id),
+            "name": r.name,
+            "client": r.client,
+            "hours_stalled": round(float(r.hours_stalled), 1),
+        }
+        for r in stalled_rows
+    ]
+
+    # ── Pipeline summary (reuse /pipeline/dashboard logic) ─────
+    try:
+        pipeline_rows = db.execute(text("""
+            SELECT pas.current_stage, COUNT(*) AS cnt
+            FROM project_agent_state pas
+            GROUP BY pas.current_stage
+        """)).fetchall()
+    except Exception:
+        pipeline_rows = []
+
+    pipeline_summary = {r.current_stage: int(r.cnt) for r in pipeline_rows}
+
+    # ── Cost summary (aggregate all clients) ───────────────────
+    try:
+        cost_row = db.execute(text("""
+            SELECT
+                COALESCE(SUM(pf.cost_usd), 0) AS total_spend,
+                COALESCE(SUM(p.revenue), 0) AS total_revenue,
+                COUNT(DISTINCT p.id) AS project_count
+            FROM projects p
+            LEFT JOIN project_financials pf ON pf.project_id = p.id
+        """)).first()
+    except Exception:
+        cost_row = None
+
+    total_spend = float(cost_row.total_spend) if cost_row else 0.0
+    total_revenue = float(cost_row.total_revenue) if cost_row else 0.0
+    avg_margin = ((total_revenue - total_spend) / total_revenue * 100) if total_revenue > 0 else 0.0
+
+    cost_summary = {
+        "total_spend": round(total_spend, 4),
+        "total_revenue": round(total_revenue, 2),
+        "avg_margin_pct": round(avg_margin, 1),
+    }
+
+    # ── Top alerts ─────────────────────────────────────────────
+    top_alerts = []
+    if stalled_projects:
+        top_alerts.append(f"{len(stalled_projects)} project(s) stalled > 48 hours")
+    if avg_margin < 20 and total_revenue > 0:
+        top_alerts.append(f"Average margin is low: {avg_margin:.1f}%")
+    if pipeline_summary.get("verify", 0) > 3:
+        top_alerts.append(f"{pipeline_summary['verify']} projects stuck in verify stage")
+
+    # ── Recommendations ────────────────────────────────────────
+    recommendations = []
+    if stalled_projects:
+        recommendations.append("Review stalled projects and reassign agents or escalate.")
+    if avg_margin < 20 and total_revenue > 0:
+        recommendations.append("Audit high-cost projects for optimization opportunities.")
+    if not top_alerts:
+        recommendations.append("All systems operating normally. No action required.")
+
+    briefing = {
+        "date": now.strftime("%Y-%m-%d"),
+        "generated_at": now.isoformat(),
+        "stalled_projects": stalled_projects,
+        "pipeline_summary": pipeline_summary,
+        "cost_summary": cost_summary,
+        "top_alerts": top_alerts,
+        "recommendations": recommendations,
+    }
+
+    # ── Save to Supabase (non-critical) ────────────────────────
+    try:
+        from tools.supabase_client import get_supabase_client
+        sc = get_supabase_client()
+        if sc:
+            sc.insert("daily_briefings", {
+                "briefing_date": now.strftime("%Y-%m-%d"),
+                "content": briefing,
+                "created_at": now.isoformat(),
+            })
+    except Exception:
+        pass
+
+    return briefing
