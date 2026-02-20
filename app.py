@@ -4583,3 +4583,46 @@ def admin_reindex(db: Session = Depends(get_db)):
         "total_records": len(rows),
         "duration_ms": duration_ms,
     }
+
+
+# ── GET /admin/audit-log ────────────────────────────────────────
+
+
+@app.get("/admin/audit-log")
+def admin_audit_log(
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """
+    Structured audit trail from agent_handoffs.
+
+    Returns recent handoff records ordered by timestamp desc.
+    Each entry includes from_agent, to_agent, project_id, outcome,
+    and timestamp.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT ah.from_agent, ah.to_agent, ah.project_id,
+                   ah.context_bundle, ah.created_at
+            FROM agent_handoffs ah
+            ORDER BY ah.created_at DESC
+            LIMIT :lim
+        """), {"lim": limit}).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    entries = []
+    for r in rows:
+        outcome = None
+        if r.context_bundle and isinstance(r.context_bundle, dict):
+            outcome = r.context_bundle.get("outcome")
+
+        entries.append({
+            "timestamp": r.created_at.isoformat() if r.created_at else None,
+            "from_agent": r.from_agent,
+            "to_agent": r.to_agent,
+            "project_id": str(r.project_id),
+            "outcome": outcome,
+        })
+
+    return {"entries": entries, "total": len(entries), "limit": limit}
