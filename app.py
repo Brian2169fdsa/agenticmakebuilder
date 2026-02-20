@@ -2013,6 +2013,249 @@ def confidence_history(project_id: str = Query(...), db: Session = Depends(get_d
     }
 
 
+@app.post("/deploy/makecom")
+def deploy_makecom(request: DeployMakecomRequest, db: Session = Depends(get_db)):
+    """
+    Deploy a blueprint to Make.com via their API.
+
+    Imports the scenario blueprint, records the deployment in the deployments
+    table, and auto-advances the pipeline to completed status.
+    """
+    import httpx
+
+    project_uuid = UUID(request.project_id)
+
+    # Validate project exists
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Build Make.com import payload
+    headers = {
+        "Authorization": f"Token {request.api_key}",
+        "Content-Type": "application/json",
+    }
+    team_id = request.team_id or 1
+    payload = {
+        "blueprint": request.blueprint,
+        "scheduling": {"type": "indefinitely", "interval": 900},
+        "teamId": team_id,
+    }
+
+    deployment_record = Deployment(
+        project_id=project_uuid,
+        target="make.com",
+        status="pending",
+    )
+    db.add(deployment_record)
+    db.commit()
+    db.refresh(deployment_record)
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"https://us1.make.com/api/v2/scenarios?teamId={team_id}",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        scenario = data.get("scenario", data)
+        deployment_record.external_id = str(scenario.get("id", ""))
+        deployment_record.external_url = f"https://us1.make.com/scenarios/{scenario.get('id', '')}"
+        deployment_record.status = "deployed"
+        deployment_record.last_health_check = {
+            "status": "deployed",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "make_response": {"id": scenario.get("id"), "name": scenario.get("name")},
+        }
+        db.commit()
+
+        # Update pipeline state
+        state = db.query(ProjectAgentState).filter(
+            ProjectAgentState.project_id == project_uuid
+        ).first()
+        if state:
+            state.current_stage = "deploy"
+            state.pipeline_health = "on_track"
+            state.updated_at = datetime.now(timezone.utc)
+            history = state.stage_history or []
+            history.append({
+                "stage": "deploy",
+                "agent": "deployer",
+                "target": "make.com",
+                "outcome": "success",
+                "external_id": str(scenario.get("id", "")),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
+            state.stage_history = history
+            db.commit()
+
+        return {
+            "success": True,
+            "deployment_id": str(deployment_record.id),
+            "target": "make.com",
+            "external_id": deployment_record.external_id,
+            "external_url": deployment_record.external_url,
+            "status": "deployed",
+        }
+
+    except httpx.HTTPStatusError as e:
+        deployment_record.status = "failed"
+        deployment_record.last_health_check = {
+            "status": "failed",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(e),
+            "status_code": e.response.status_code if e.response else None,
+        }
+        db.commit()
+        raise HTTPException(status_code=502, detail=f"Make.com API error: {str(e)}")
+
+    except Exception as e:
+        deployment_record.status = "failed"
+        deployment_record.last_health_check = {
+            "status": "failed",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(e),
+        }
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Deployment failed: {str(e)}")
+
+
+@app.post("/deploy/n8n")
+def deploy_n8n(request: DeployN8nRequest, db: Session = Depends(get_db)):
+    """
+    Deploy a workflow to n8n via their REST API.
+
+    Imports the workflow JSON, records the deployment, and updates pipeline state.
+    """
+    import httpx
+
+    project_uuid = UUID(request.project_id)
+
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    headers = {
+        "X-N8N-API-KEY": request.api_key,
+        "Content-Type": "application/json",
+    }
+
+    deployment_record = Deployment(
+        project_id=project_uuid,
+        target="n8n",
+        status="pending",
+    )
+    db.add(deployment_record)
+    db.commit()
+    db.refresh(deployment_record)
+
+    n8n_base = request.n8n_url.rstrip("/")
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"{n8n_base}/api/v1/workflows",
+                headers=headers,
+                json=request.workflow,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        workflow_id = str(data.get("id", ""))
+        deployment_record.external_id = workflow_id
+        deployment_record.external_url = f"{n8n_base}/workflow/{workflow_id}"
+        deployment_record.status = "deployed"
+        deployment_record.last_health_check = {
+            "status": "deployed",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "n8n_response": {"id": data.get("id"), "name": data.get("name")},
+        }
+        db.commit()
+
+        # Update pipeline state
+        state = db.query(ProjectAgentState).filter(
+            ProjectAgentState.project_id == project_uuid
+        ).first()
+        if state:
+            state.current_stage = "deploy"
+            state.pipeline_health = "on_track"
+            state.updated_at = datetime.now(timezone.utc)
+            history = state.stage_history or []
+            history.append({
+                "stage": "deploy",
+                "agent": "deployer",
+                "target": "n8n",
+                "outcome": "success",
+                "external_id": workflow_id,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
+            state.stage_history = history
+            db.commit()
+
+        return {
+            "success": True,
+            "deployment_id": str(deployment_record.id),
+            "target": "n8n",
+            "external_id": workflow_id,
+            "external_url": deployment_record.external_url,
+            "status": "deployed",
+        }
+
+    except httpx.HTTPStatusError as e:
+        deployment_record.status = "failed"
+        deployment_record.last_health_check = {
+            "status": "failed",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(e),
+            "status_code": e.response.status_code if e.response else None,
+        }
+        db.commit()
+        raise HTTPException(status_code=502, detail=f"n8n API error: {str(e)}")
+
+    except Exception as e:
+        deployment_record.status = "failed"
+        deployment_record.last_health_check = {
+            "status": "failed",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(e),
+        }
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Deployment failed: {str(e)}")
+
+
+@app.get("/deploy/status")
+def deploy_status(project_id: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Get deployment status for a project.
+    Returns all deployments with their current status and health check info.
+    """
+    project_uuid = UUID(project_id)
+
+    deployments = db.query(Deployment).filter(
+        Deployment.project_id == project_uuid
+    ).order_by(Deployment.deployed_at.desc()).all()
+
+    return {
+        "project_id": project_id,
+        "total_deployments": len(deployments),
+        "deployments": [
+            {
+                "id": str(d.id),
+                "target": d.target,
+                "external_id": d.external_id,
+                "external_url": d.external_url,
+                "status": d.status,
+                "last_health_check": d.last_health_check,
+                "deployed_at": d.deployed_at.isoformat() if d.deployed_at else None,
+            }
+            for d in deployments
+        ],
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
