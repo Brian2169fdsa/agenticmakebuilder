@@ -911,6 +911,169 @@ def supervisor_stalled(db: Session = Depends(get_db)):
     }
 
 
+# ─────────────────────────────────────────
+# POST /costs/track — Token cost tracking
+# ─────────────────────────────────────────
+
+# Per-token pricing (USD) — updated for Claude 4.5/4.6 family
+_MODEL_PRICING = {
+    "claude-opus-4-6":       {"input": 15.00 / 1_000_000, "output": 75.00 / 1_000_000},
+    "claude-sonnet-4-6":     {"input":  3.00 / 1_000_000, "output": 15.00 / 1_000_000},
+    "claude-haiku-4-5":      {"input":  0.80 / 1_000_000, "output":  4.00 / 1_000_000},
+    "claude-sonnet-4-5":     {"input":  3.00 / 1_000_000, "output": 15.00 / 1_000_000},
+    "gpt-4o":                {"input":  2.50 / 1_000_000, "output": 10.00 / 1_000_000},
+    "gpt-4o-mini":           {"input":  0.15 / 1_000_000, "output":  0.60 / 1_000_000},
+}
+
+
+@app.post("/costs/track")
+def costs_track(request: CostTrackRequest, db: Session = Depends(get_db)):
+    """
+    Track token costs for a project operation.
+
+    Accepts project_id, model, input_tokens, output_tokens, and operation_type.
+    Calculates cost in USD using model pricing and stores to project_financials.
+    """
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    # Verify project exists
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    if request.input_tokens < 0 or request.output_tokens < 0:
+        raise HTTPException(status_code=400, detail="Token counts must be non-negative")
+
+    # Calculate cost
+    pricing = _MODEL_PRICING.get(request.model)
+    if pricing:
+        cost_usd = (request.input_tokens * pricing["input"]
+                     + request.output_tokens * pricing["output"])
+    else:
+        # Unknown model — estimate at mid-tier pricing
+        cost_usd = (request.input_tokens * 3.0 / 1_000_000
+                     + request.output_tokens * 15.0 / 1_000_000)
+
+    cost_usd = round(cost_usd, 6)
+
+    try:
+        record = ProjectFinancial(
+            project_id=project_uuid,
+            model=request.model,
+            input_tokens=request.input_tokens,
+            output_tokens=request.output_tokens,
+            operation_type=request.operation_type,
+            cost_usd=cost_usd,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to store cost record: {str(e)}")
+
+    return {
+        "id": str(record.id),
+        "project_id": str(record.project_id),
+        "model": record.model,
+        "input_tokens": record.input_tokens,
+        "output_tokens": record.output_tokens,
+        "operation_type": record.operation_type,
+        "cost_usd": record.cost_usd,
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+# ─────────────────────────────────────────
+# GET /costs/summary — Cost/revenue/margin per client
+# ─────────────────────────────────────────
+
+@app.get("/costs/summary")
+def costs_summary(client_id: str = Query(..., description="Customer name or project name"),
+                  db: Session = Depends(get_db)):
+    """
+    Returns total cost, total revenue, and margin per project and overall
+    for a given client.
+
+    client_id matches against projects.customer_name (case-insensitive).
+    """
+    if not client_id.strip():
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    try:
+        # Per-project breakdown
+        rows = db.execute(text("""
+            SELECT
+                p.id AS project_id,
+                p.name AS project_name,
+                COALESCE(p.revenue, 0) AS revenue,
+                COALESCE(SUM(pf.cost_usd), 0) AS total_cost,
+                COALESCE(SUM(pf.input_tokens), 0) AS total_input_tokens,
+                COALESCE(SUM(pf.output_tokens), 0) AS total_output_tokens,
+                COUNT(pf.id) AS operation_count
+            FROM projects p
+            LEFT JOIN project_financials pf ON pf.project_id = p.id
+            WHERE LOWER(p.customer_name) = LOWER(:client_id)
+               OR LOWER(p.name) = LOWER(:client_id)
+            GROUP BY p.id, p.name, p.revenue
+            ORDER BY p.name
+        """), {"client_id": client_id.strip()}).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No projects found for client '{client_id}'")
+
+    projects = []
+    total_cost = 0.0
+    total_revenue = 0.0
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for row in rows:
+        cost = float(row.total_cost)
+        revenue = float(row.revenue)
+        margin = revenue - cost
+        margin_pct = (margin / revenue * 100) if revenue > 0 else 0.0
+
+        projects.append({
+            "project_id": str(row.project_id),
+            "project_name": row.project_name,
+            "total_cost": round(cost, 4),
+            "revenue": round(revenue, 2),
+            "margin": round(margin, 4),
+            "margin_pct": round(margin_pct, 1),
+            "total_input_tokens": int(row.total_input_tokens),
+            "total_output_tokens": int(row.total_output_tokens),
+            "operation_count": int(row.operation_count),
+        })
+
+        total_cost += cost
+        total_revenue += revenue
+        total_input_tokens += int(row.total_input_tokens)
+        total_output_tokens += int(row.total_output_tokens)
+
+    overall_margin = total_revenue - total_cost
+    overall_margin_pct = (overall_margin / total_revenue * 100) if total_revenue > 0 else 0.0
+
+    return {
+        "client_id": client_id,
+        "project_count": len(projects),
+        "overall": {
+            "total_cost": round(total_cost, 4),
+            "total_revenue": round(total_revenue, 2),
+            "margin": round(overall_margin, 4),
+            "margin_pct": round(overall_margin_pct, 1),
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+        },
+        "projects": projects,
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
