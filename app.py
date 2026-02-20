@@ -78,6 +78,9 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+import os
+import anthropic
+
 from db.session import get_db, check_db
 from db.models import (
     AgentHandoff, ProjectFinancial, Project, PersonaClientContext, PersonaFeedback,
@@ -3328,3 +3331,95 @@ def persona_deploy(request: PersonaDeployRequest, db: Session = Depends(get_db))
     }
 
     return artifact
+
+
+# ── POST /persona/test ─────────────────────────────────────────
+
+
+class PersonaTestRequest(BaseModel):
+    persona: str
+    message: str
+    client_id: Optional[str] = None
+
+
+@app.post("/persona/test")
+def persona_test(request: PersonaTestRequest, db: Session = Depends(get_db)):
+    """
+    Send a message through the Claude API using a persona's system prompt.
+
+    Builds the system prompt from the base persona definition, merges in
+    client-specific tone preferences if client_id is provided and a
+    persona_client_context row exists, then calls the Claude API and
+    returns the response.
+    """
+    persona = _validate_persona(request.persona)
+
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="message is required")
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+
+    base = _PERSONA_DEFAULTS[persona]
+    tone = base["base_tone"]
+    style = base["base_style"]
+    tone_applied = False
+
+    # Merge client-specific context if available
+    if request.client_id and request.client_id.strip():
+        ctx = (
+            db.query(PersonaClientContext)
+            .filter(
+                PersonaClientContext.persona == persona,
+                PersonaClientContext.client_id == request.client_id.strip(),
+            )
+            .first()
+        )
+        if ctx:
+            if ctx.tone_preferences:
+                tone = ctx.tone_preferences
+                tone_applied = True
+            if ctx.communication_style:
+                style = ctx.communication_style
+                tone_applied = True
+
+    # Build system prompt
+    tone_str = (
+        tone if isinstance(tone, str)
+        else ", ".join(f"{k}: {v}" for k, v in tone.items()) if isinstance(tone, dict)
+        else str(tone)
+    )
+    system_prompt = (
+        f"You are {base['display_name']}, {base['role']} at ManageAI.\n\n"
+        f"Tone: {tone_str}\n"
+        f"Communication style: {style}\n\n"
+        f"Knowledge bases available: {', '.join(base['knowledge_bases'])}\n\n"
+        "Always stay in character. Be helpful, accurate, and professional."
+    )
+
+    if request.client_id and request.client_id.strip():
+        system_prompt += f"\nYou are speaking with client '{request.client_id.strip()}'."
+
+    # Call Claude API
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": request.message.strip()}],
+        )
+        response_text = response.content[0].text
+    except anthropic.APIError as e:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
+
+    return {
+        "persona": persona,
+        "display_name": base["display_name"],
+        "role": base["role"],
+        "response": response_text,
+        "tone_applied": tone_applied,
+        "client_id": request.client_id.strip() if request.client_id else None,
+        "model": "claude-sonnet-4-20250514",
+    }
