@@ -1,29 +1,70 @@
 """
-Agentic Make Builder — FastAPI Application
+Agentic Make Builder — FastAPI Application (v2.0.0)
 
-Endpoints:
-  GET  /health             — liveness probe
-  POST /intake             — natural language → assessment (no structured fields needed)
-  POST /assess             — structured intake → delivery report + plan_dict
-  POST /plan               — structured intake → full pipeline (assess + build + 11 artifacts)
-  POST /build              — plan_dict + original_request → full pipeline (compiler direct)
-  POST /audit              — audit an existing Make.com scenario blueprint
-  POST /verify             — 77-rule blueprint validation with fix instructions
-  POST /handoff            — multi-agent orchestration handoff bridge
-  GET  /supervisor/stalled — detect stalled projects (>48h no update)
-  POST /costs/track        — track per-operation token costs
-  GET  /costs/summary      — cost/revenue/margin summary per client
-  POST /persona/memory     — link persona to client with tone/style prefs
-  GET  /persona/context    — get persona's full context for a client
-  POST /persona/feedback   — store interaction feedback for a persona
-  GET  /persona/performance — persona performance stats across all clients
-  POST /persona/deploy     — generate client-specific persona artifact
+Endpoints (35 total):
+
+  Core Pipeline:
+    GET  /health              — liveness probe
+    POST /intake              — natural language → assessment
+    POST /assess              — structured intake → delivery report + plan_dict
+    POST /plan                — full pipeline (assess + build + 11 artifacts)
+    POST /build               — compiler direct (requires plan_dict)
+    POST /audit               — audit existing Make.com blueprint
+
+  Verification & Confidence:
+    POST /verify              — 77-rule blueprint validation with fix instructions
+    POST /verify/loop         — iterative verify → fix → verify cycle (max 5 iterations)
+    GET  /confidence/history  — verification run history with score trends
+
+  Multi-Agent Orchestration:
+    POST /orchestrate         — advance project through pipeline stages
+    POST /agent/complete      — agent completion + auto-advance
+    GET  /pipeline/status     — full pipeline state view
+    POST /briefing            — daily supervisor briefing report
+    POST /handoff             — multi-agent handoff bridge
+
+  Agent Memory & Learning:
+    POST /memory              — store client context (decisions, tech stack, patterns)
+    GET  /memory              — retrieve client context
+    POST /memory/embed        — embed project brief for similarity search
+    GET  /similar             — TF-IDF cosine similarity search
+
+  Deployment Agent:
+    POST /deploy/makecom      — deploy blueprint to Make.com via API
+    POST /deploy/n8n          — deploy workflow to n8n via REST API
+    GET  /deploy/status       — deployment status + health checks
+
+  Cost & Margin Intelligence:
+    POST /costs/track         — track token costs with auto-margin + alerts
+    GET  /costs/summary       — cost/revenue/margin per client
+    GET  /costs/report        — weekly cost report in markdown
+    POST /costs/estimate      — pre-build cost estimation from historical data
+
+  Persona Engine:
+    POST /persona/memory      — link persona to client with tone/style prefs
+    GET  /persona/context     — persona's full context for a client
+    POST /persona/feedback    — store interaction feedback
+    GET  /persona/performance — persona performance stats
+    POST /persona/deploy      — generate client-specific persona artifact
+
+  Platform Health:
+    GET  /health/full         — comprehensive health check (DB, tables, embeddings, pipeline)
+    GET  /health/memory       — embedding store stats + vocabulary analysis
+    POST /health/repair       — self-healing (stalled pipelines, orphans, stale deploys)
+
+  Supervisor:
+    GET  /supervisor/stalled  — detect stalled projects (>48h)
+
+  Natural Language:
+    POST /command             — route free-text commands to endpoints
 
 HTTP status codes:
   200 — success
   400 — malformed request / missing required fields
+  404 — resource not found
   422 — validation failure (spec/export errors, confidence too low)
   500 — internal pipeline error
+  502 — upstream API error (Make.com, n8n)
 """
 
 from contextlib import asynccontextmanager
@@ -71,7 +112,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Agentic Make Builder",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -136,6 +177,62 @@ class CostTrackRequest(BaseModel):
     input_tokens: int
     output_tokens: int
     operation_type: str                    # e.g. "assess", "build", "iterate"
+
+
+class OrchestrateRequest(BaseModel):
+    project_id: str
+    current_stage: str  # intake | build | verify | deploy
+
+
+class AgentCompleteRequest(BaseModel):
+    project_id: str
+    agent_name: str
+    outcome: str  # success | failed | needs_review
+    artifacts: Optional[dict] = None
+
+
+class MemoryRequest(BaseModel):
+    client_id: str
+    project_id: str
+    key_decisions: Optional[list] = None
+    tech_stack: Optional[list] = None
+    failure_patterns: Optional[list] = None
+
+
+class VerifyLoopRequest(BaseModel):
+    project_id: str
+    blueprint: dict
+    max_iterations: Optional[int] = 3
+
+
+class DeployMakecomRequest(BaseModel):
+    project_id: str
+    blueprint: dict
+    api_key: str
+    team_id: Optional[int] = None
+
+
+class DeployN8nRequest(BaseModel):
+    project_id: str
+    workflow: dict
+    n8n_url: str
+    api_key: str
+
+
+class CostEstimateRequest(BaseModel):
+    description: str
+    category: Optional[str] = "standard"
+
+
+class CommandRequest(BaseModel):
+    command: str
+    customer_name: Optional[str] = None
+
+
+class EmbedRequest(BaseModel):
+    project_id: str
+    brief: str
+    outcome: Optional[str] = None
 
 
 # ─────────────────────────────────────────
@@ -1418,56 +1515,6 @@ _STAGE_AGENT_MAP = {
 _STAGE_ORDER = ["intake", "build", "verify", "deploy"]
 
 
-class OrchestrateRequest(BaseModel):
-    project_id: str
-    current_stage: str  # intake | build | verify | deploy
-
-
-class AgentCompleteRequest(BaseModel):
-    project_id: str
-    agent_name: str
-    outcome: str  # success | failed | needs_review
-    artifacts: Optional[dict] = None
-
-
-class MemoryRequest(BaseModel):
-    client_id: str
-    project_id: str
-    key_decisions: Optional[list] = None
-    tech_stack: Optional[list] = None
-    failure_patterns: Optional[list] = None
-
-
-class VerifyLoopRequest(BaseModel):
-    project_id: str
-    blueprint: dict
-    max_iterations: Optional[int] = 3
-
-
-class DeployMakecomRequest(BaseModel):
-    project_id: str
-    blueprint: dict
-    api_key: str
-    team_id: Optional[int] = None
-
-
-class DeployN8nRequest(BaseModel):
-    project_id: str
-    workflow: dict
-    n8n_url: str
-    api_key: str
-
-
-class CostEstimateRequest(BaseModel):
-    description: str
-    category: Optional[str] = "standard"
-
-
-class CommandRequest(BaseModel):
-    command: str
-    customer_name: Optional[str] = None
-
-
 @app.post("/orchestrate")
 def orchestrate(request: OrchestrateRequest, db: Session = Depends(get_db)):
     """
@@ -1951,12 +1998,6 @@ def memory_get(client_id: str = Query(...), db: Session = Depends(get_db)):
         },
         "projects": projects,
     }
-
-
-class EmbedRequest(BaseModel):
-    project_id: str
-    brief: str
-    outcome: Optional[str] = None
 
 
 @app.post("/memory/embed")
