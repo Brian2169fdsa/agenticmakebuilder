@@ -1285,3 +1285,103 @@ def persona_feedback(request: PersonaFeedbackRequest, db: Session = Depends(get_
         "notes": record.notes,
         "created_at": record.created_at.isoformat(),
     }
+
+
+# ─────────────────────────────────────────
+# GET /persona/performance
+# ─────────────────────────────────────────
+
+@app.get("/persona/performance")
+def persona_performance(
+    persona: str = Query(..., description="Persona name"),
+    db: Session = Depends(get_db),
+):
+    """
+    Return performance stats for a persona across all clients.
+    Includes average rating, total interactions, rating distribution,
+    and top feedback themes extracted from notes.
+    """
+    p = _validate_persona(persona)
+
+    stats_row = db.execute(
+        text("""
+            SELECT
+                COUNT(*) AS total_interactions,
+                COALESCE(AVG(rating), 0) AS avg_rating,
+                COUNT(DISTINCT client_id) AS unique_clients,
+                COUNT(*) FILTER (WHERE rating = 5) AS five_star,
+                COUNT(*) FILTER (WHERE rating = 4) AS four_star,
+                COUNT(*) FILTER (WHERE rating = 3) AS three_star,
+                COUNT(*) FILTER (WHERE rating = 2) AS two_star,
+                COUNT(*) FILTER (WHERE rating = 1) AS one_star
+            FROM persona_feedback
+            WHERE persona = :persona
+        """),
+        {"persona": p},
+    ).fetchone()
+
+    total = stats_row.total_interactions if stats_row else 0
+
+    if total == 0:
+        return {
+            "persona": p,
+            "total_interactions": 0,
+            "avg_rating": None,
+            "unique_clients": 0,
+            "rating_distribution": {},
+            "top_feedback_themes": [],
+        }
+
+    # Extract top feedback themes from notes
+    notes_rows = db.execute(
+        text("""
+            SELECT notes FROM persona_feedback
+            WHERE persona = :persona AND notes IS NOT NULL AND notes != ''
+        """),
+        {"persona": p},
+    ).fetchall()
+
+    themes = _extract_feedback_themes([r.notes for r in notes_rows])
+
+    return {
+        "persona": p,
+        "total_interactions": total,
+        "avg_rating": round(float(stats_row.avg_rating), 2),
+        "unique_clients": stats_row.unique_clients,
+        "rating_distribution": {
+            "5": stats_row.five_star,
+            "4": stats_row.four_star,
+            "3": stats_row.three_star,
+            "2": stats_row.two_star,
+            "1": stats_row.one_star,
+        },
+        "top_feedback_themes": themes,
+    }
+
+
+def _extract_feedback_themes(notes_list: list[str], top_n: int = 5) -> list[dict]:
+    """Extract top recurring themes from feedback notes via word frequency."""
+    from collections import Counter
+
+    stop_words = {
+        "the", "a", "an", "is", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would",
+        "could", "should", "may", "might", "shall", "can", "to", "of",
+        "in", "for", "on", "with", "at", "by", "from", "as", "into",
+        "through", "during", "before", "after", "and", "but", "or",
+        "not", "no", "so", "if", "than", "too", "very", "just", "about",
+        "up", "out", "that", "this", "it", "i", "me", "my", "we", "our",
+        "they", "them", "their", "she", "he", "her", "his", "you", "your",
+    }
+
+    word_counts: Counter = Counter()
+    for note in notes_list:
+        words = note.lower().split()
+        meaningful = [w.strip(".,!?;:'\"()") for w in words if len(w) > 2]
+        meaningful = [w for w in meaningful if w and w not in stop_words]
+        word_counts.update(meaningful)
+
+    return [
+        {"theme": word, "count": count}
+        for word, count in word_counts.most_common(top_n)
+    ]
