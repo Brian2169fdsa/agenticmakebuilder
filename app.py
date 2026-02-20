@@ -654,6 +654,18 @@ def verify(request: VerifyRequest, db: Session = Depends(get_db)):
         except Exception:
             pass  # Non-critical
 
+    # Send build fail alert if verification failed
+    if request.project_id and not passed:
+        try:
+            from tools.notification_sender import send_build_fail_alert
+            send_build_fail_alert(
+                project_id=request.project_id,
+                confidence_score=score_100,
+                fix_count=len(fix_instructions),
+            )
+        except Exception:
+            pass  # Non-critical
+
     result = {
         "confidence_score": score_100,
         "passed": passed,
