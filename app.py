@@ -137,8 +137,23 @@ async def lifespan(_app: FastAPI):
         _registry = {"registry_version": "0", "modules": {}, "module_count": 0}
     print(">>> STARTUP: Checking database...")
     check_db()
+    from tools.auth import AUTH_ENABLED
+    auth_status = "ENABLED" if AUTH_ENABLED else "DISABLED (set AUTH_ENABLED=true to enable)"
+    print(f">>> STARTUP: Authentication: {auth_status}")
+    print(">>> STARTUP: Starting job worker...")
+    try:
+        from tools.job_worker import start_worker
+        start_worker()
+        print(">>> STARTUP: Job worker started")
+    except Exception as e:
+        print(f">>> STARTUP: Job worker not started: {e}")
     print(">>> STARTUP: Ready to serve requests")
     yield
+    try:
+        from tools.job_worker import stop_worker
+        stop_worker()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -286,6 +301,49 @@ class DeployRunRequest(BaseModel):
 class DeployTeardownRequest(BaseModel):
     scenario_id: int
     project_id: str
+
+
+class CreateApiKeyRequest(BaseModel):
+    name: str
+    tenant_id: Optional[str] = "default"
+    permissions: Optional[list] = None
+    rate_limit_per_minute: Optional[int] = 60
+    expires_in_days: Optional[int] = None
+
+
+class RotateApiKeyRequest(BaseModel):
+    key_id: str
+
+
+class JobEnqueueRequest(BaseModel):
+    job_type: str
+    payload: Optional[dict] = None
+    project_id: Optional[str] = None
+    priority: Optional[int] = 5
+
+
+class EventSubscribeRequest(BaseModel):
+    event_type: str
+    target_url: str
+    secret: Optional[str] = None
+    tenant_id: Optional[str] = "default"
+
+
+class CreateTenantRequest(BaseModel):
+    id: str
+    name: str
+    plan: Optional[str] = "standard"
+    rate_limit_per_minute: Optional[int] = 60
+    max_projects: Optional[int] = 50
+    max_api_keys: Optional[int] = 5
+
+
+class UpdateTenantRequest(BaseModel):
+    plan: Optional[str] = None
+    rate_limit_per_minute: Optional[int] = None
+    max_projects: Optional[int] = None
+    max_api_keys: Optional[int] = None
+    features: Optional[list] = None
 
 
 # ─────────────────────────────────────────
@@ -4999,3 +5057,629 @@ def admin_audit_log(
         })
 
     return {"entries": entries, "total": len(entries), "limit": limit}
+
+
+# ── PHASE 1: Authentication Layer ───────────────────────────────
+
+
+@app.post("/auth/keys")
+def create_api_key(request: CreateApiKeyRequest, db: Session = Depends(get_db)):
+    """Create a new API key. The raw key is shown ONCE — save it immediately."""
+    from tools.auth import generate_api_key, hash_key
+
+    raw_key, key_hash = generate_api_key()
+    permissions = request.permissions or ["read", "write"]
+    expires_at = None
+    if request.expires_in_days:
+        from datetime import timedelta
+        expires_at = datetime.now(timezone.utc) + timedelta(days=request.expires_in_days)
+
+    try:
+        result = db.execute(text(
+            "INSERT INTO api_keys (key_hash, key_prefix, name, tenant_id, permissions, "
+            "rate_limit_per_minute, expires_at) "
+            "VALUES (:hash, :prefix, :name, :tid, :perms, :rl, :exp) RETURNING id, created_at"
+        ), {
+            "hash": key_hash,
+            "prefix": raw_key[:7],
+            "name": request.name,
+            "tid": request.tenant_id,
+            "perms": str(permissions).replace("'", '"'),
+            "rl": request.rate_limit_per_minute,
+            "exp": expires_at.isoformat() if expires_at else None,
+        })
+        row = result.fetchone()
+        db.commit()
+        return {
+            "key_id": str(row.id),
+            "raw_key": raw_key,
+            "key_prefix": raw_key[:7],
+            "name": request.name,
+            "tenant_id": request.tenant_id,
+            "permissions": permissions,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "warning": "Save this key now — it cannot be retrieved again.",
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create API key: {e}")
+
+
+@app.get("/auth/keys")
+def list_api_keys(db: Session = Depends(get_db)):
+    """List all API keys. Raw keys are never shown."""
+    try:
+        rows = db.execute(text(
+            "SELECT id, key_prefix, name, tenant_id, permissions, "
+            "rate_limit_per_minute, last_used_at, expires_at, revoked, created_at "
+            "FROM api_keys ORDER BY created_at DESC"
+        )).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+    keys = []
+    for r in rows:
+        keys.append({
+            "id": str(r.id),
+            "key_prefix": r.key_prefix,
+            "name": r.name,
+            "tenant_id": r.tenant_id,
+            "permissions": r.permissions,
+            "rate_limit_per_minute": r.rate_limit_per_minute,
+            "last_used_at": r.last_used_at.isoformat() if r.last_used_at else None,
+            "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+            "revoked": r.revoked,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return {"keys": keys, "total": len(keys)}
+
+
+@app.delete("/auth/keys/{key_id}")
+def revoke_api_key(key_id: str, db: Session = Depends(get_db)):
+    """Revoke an API key."""
+    try:
+        UUID(key_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid key_id format")
+
+    try:
+        db.execute(text(
+            "UPDATE api_keys SET revoked = true WHERE id = :kid"
+        ), {"kid": key_id})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Revoke failed: {e}")
+    return {"revoked": True, "key_id": key_id}
+
+
+@app.post("/auth/keys/rotate")
+def rotate_api_key(request: RotateApiKeyRequest, db: Session = Depends(get_db)):
+    """Revoke old key and create new one with same settings."""
+    from tools.auth import generate_api_key
+
+    try:
+        old = db.execute(text(
+            "SELECT name, tenant_id, permissions, rate_limit_per_minute FROM api_keys WHERE id = :kid"
+        ), {"kid": request.key_id}).fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lookup failed: {e}")
+
+    if not old:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    # Revoke old
+    db.execute(text("UPDATE api_keys SET revoked = true WHERE id = :kid"), {"kid": request.key_id})
+
+    # Create new
+    raw_key, key_hash = generate_api_key()
+    perms = old.permissions or ["read", "write"]
+    db.execute(text(
+        "INSERT INTO api_keys (key_hash, key_prefix, name, tenant_id, permissions, rate_limit_per_minute) "
+        "VALUES (:hash, :prefix, :name, :tid, :perms, :rl)"
+    ), {
+        "hash": key_hash, "prefix": raw_key[:7], "name": old.name,
+        "tid": old.tenant_id, "perms": str(perms).replace("'", '"'),
+        "rl": old.rate_limit_per_minute,
+    })
+    db.commit()
+    return {
+        "rotated": True,
+        "old_key_id": request.key_id,
+        "raw_key": raw_key,
+        "key_prefix": raw_key[:7],
+        "warning": "Save this key now — it cannot be retrieved again.",
+    }
+
+
+# ── PHASE 2: Job Queue Endpoints ────────────────────────────────
+
+
+@app.post("/jobs/enqueue")
+def enqueue_job_endpoint(request: JobEnqueueRequest, db: Session = Depends(get_db)):
+    """Enqueue a background job."""
+    valid_types = ["plan", "verify", "deploy", "embed", "bulk_verify", "reindex", "monitor_deployments"]
+    if request.job_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"Invalid job_type. Valid: {valid_types}")
+    if request.priority is not None and not (1 <= request.priority <= 10):
+        raise HTTPException(status_code=400, detail="Priority must be 1-10")
+
+    from tools.job_queue import enqueue_job
+    job_id = enqueue_job(
+        job_type=request.job_type,
+        payload=request.payload or {},
+        project_id=request.project_id,
+        priority=request.priority or 5,
+    )
+
+    # Get queue position
+    try:
+        pos = db.execute(text(
+            "SELECT COUNT(*) FROM job_queue WHERE status = 'pending' AND created_at <= "
+            "(SELECT created_at FROM job_queue WHERE id = :jid)"
+        ), {"jid": job_id}).scalar() or 0
+    except Exception:
+        pos = 0
+
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "queue_position": pos,
+        "estimated_wait_seconds": pos * 3,
+    }
+
+
+@app.get("/jobs/{job_id}")
+def get_job_endpoint(job_id: str, db: Session = Depends(get_db)):
+    """Get job status and result."""
+    from tools.job_queue import get_job
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    elapsed = None
+    if job.get("created_at"):
+        try:
+            created = job["created_at"]
+            if isinstance(created, str):
+                from datetime import datetime as dt
+                created = dt.fromisoformat(created.replace("Z", "+00:00"))
+            elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+        except Exception:
+            pass
+
+    job["elapsed_seconds"] = round(elapsed, 1) if elapsed else None
+    job["is_complete"] = job.get("status") in ("completed", "failed", "cancelled")
+    return job
+
+
+@app.get("/jobs/list")
+def list_jobs_endpoint(
+    status: Optional[str] = None,
+    job_type: Optional[str] = None,
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """List jobs with optional filters."""
+    query = "SELECT * FROM job_queue WHERE 1=1"
+    params = {}
+    if status:
+        query += " AND status = :status"
+        params["status"] = status
+    if job_type:
+        query += " AND job_type = :jt"
+        params["jt"] = job_type
+    query += " ORDER BY created_at DESC LIMIT :lim"
+    params["lim"] = limit
+
+    try:
+        rows = db.execute(text(query), params).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+    jobs = []
+    for r in rows:
+        jobs.append({
+            "id": str(r.id), "job_type": r.job_type, "status": r.status,
+            "project_id": r.project_id, "priority": r.priority,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "retry_count": r.retry_count,
+        })
+
+    # Stats
+    try:
+        stats_rows = db.execute(text(
+            "SELECT status, COUNT(*) as cnt FROM job_queue GROUP BY status"
+        )).fetchall()
+        stats = {r.status: r.cnt for r in stats_rows}
+    except Exception:
+        stats = {}
+
+    return {"jobs": jobs, "total": len(jobs), "stats": stats}
+
+
+@app.delete("/jobs/{job_id}/cancel")
+def cancel_job_endpoint(job_id: str, db: Session = Depends(get_db)):
+    """Cancel a pending job."""
+    from tools.job_queue import cancel_job
+    cancelled = cancel_job(job_id)
+    return {"cancelled": cancelled, "job_id": job_id}
+
+
+@app.get("/jobs/stats")
+def job_stats_endpoint(db: Session = Depends(get_db)):
+    """Job queue statistics."""
+    from tools.job_queue import get_job_stats
+    return get_job_stats()
+
+
+@app.post("/jobs/cleanup")
+def cleanup_jobs_endpoint(days: int = Query(7, ge=1), db: Session = Depends(get_db)):
+    """Remove old completed/failed/cancelled jobs."""
+    from tools.job_queue import cleanup_old_jobs
+    deleted = cleanup_old_jobs(days=days)
+    return {"deleted_count": deleted}
+
+
+# ── PHASE 5: Learning Feedback Loop (GET /learn/summary) ────────
+
+
+@app.get("/learn/summary")
+def learn_summary(db: Session = Depends(get_db)):
+    """Aggregate stats across all learning outcomes."""
+    try:
+        rows = db.execute(text(
+            "SELECT outcome, COUNT(*) as cnt, "
+            "AVG(execution_count) as avg_exec, AVG(avg_duration_ms) as avg_dur "
+            "FROM learning_outcomes GROUP BY outcome"
+        )).fetchall()
+    except Exception:
+        rows = []
+
+    total = 0
+    success_count = 0
+    failure_count = 0
+    partial_count = 0
+    avg_exec_success = 0
+    avg_exec_failure = 0
+
+    for r in rows:
+        total += r.cnt
+        if r.outcome == "success":
+            success_count = r.cnt
+            avg_exec_success = round(r.avg_exec or 0, 1)
+        elif r.outcome == "failure":
+            failure_count = r.cnt
+            avg_exec_failure = round(r.avg_exec or 0, 1)
+        elif r.outcome == "partial":
+            partial_count = r.cnt
+
+    # Common error patterns
+    error_patterns = []
+    try:
+        ep_rows = db.execute(text(
+            "SELECT unnest(error_patterns) AS pattern, COUNT(*) AS cnt "
+            "FROM learning_outcomes WHERE error_patterns != '{}' "
+            "GROUP BY pattern ORDER BY cnt DESC LIMIT 10"
+        )).fetchall()
+        error_patterns = [{"pattern": r.pattern, "count": r.cnt} for r in ep_rows]
+    except Exception:
+        pass
+
+    success_rate = round(success_count / total, 3) if total > 0 else 0
+
+    return {
+        "total_outcomes": total,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "partial_count": partial_count,
+        "success_rate": success_rate,
+        "common_error_patterns": error_patterns,
+        "avg_executions_on_success": avg_exec_success,
+        "avg_executions_on_failure": avg_exec_failure,
+    }
+
+
+# ── PHASE 6: Webhook Event Bus ──────────────────────────────────
+
+
+@app.post("/events/subscribe")
+def event_subscribe(request: EventSubscribeRequest, db: Session = Depends(get_db)):
+    """Subscribe to platform events via webhook."""
+    from tools.event_bus import EVENT_TYPES
+    if request.event_type not in EVENT_TYPES:
+        raise HTTPException(status_code=422, detail=f"Unknown event type. Valid: {EVENT_TYPES}")
+    try:
+        result = db.execute(text(
+            "INSERT INTO webhook_subscriptions (event_type, target_url, secret, tenant_id) "
+            "VALUES (:et, :url, :secret, :tid) RETURNING id"
+        ), {"et": request.event_type, "url": request.target_url,
+            "secret": request.secret, "tid": request.tenant_id})
+        row = result.fetchone()
+        db.commit()
+        return {
+            "subscription_id": str(row.id),
+            "event_type": request.event_type,
+            "target_url": request.target_url,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Subscribe failed: {e}")
+
+
+@app.delete("/events/subscriptions/{subscription_id}")
+def event_unsubscribe(subscription_id: str, db: Session = Depends(get_db)):
+    """Deactivate a webhook subscription."""
+    try:
+        db.execute(text(
+            "UPDATE webhook_subscriptions SET active = false WHERE id = :sid"
+        ), {"sid": subscription_id})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Unsubscribe failed: {e}")
+    return {"deactivated": True, "subscription_id": subscription_id}
+
+
+@app.get("/events/subscriptions")
+def list_event_subscriptions(
+    tenant_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """List all webhook subscriptions."""
+    query = "SELECT * FROM webhook_subscriptions WHERE 1=1"
+    params = {}
+    if tenant_id:
+        query += " AND tenant_id = :tid"
+        params["tid"] = tenant_id
+    query += " ORDER BY created_at DESC"
+
+    try:
+        rows = db.execute(text(query), params).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+    subs = []
+    for r in rows:
+        subs.append({
+            "id": str(r.id), "event_type": r.event_type,
+            "target_url": r.target_url, "tenant_id": r.tenant_id,
+            "active": r.active, "failure_count": r.failure_count,
+            "last_triggered_at": r.last_triggered_at.isoformat() if r.last_triggered_at else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return {"subscriptions": subs, "total": len(subs)}
+
+
+@app.get("/events/deliveries")
+def list_event_deliveries(
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """List recent webhook deliveries."""
+    try:
+        rows = db.execute(text(
+            "SELECT * FROM webhook_deliveries ORDER BY delivered_at DESC LIMIT :lim"
+        ), {"lim": limit}).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+    deliveries = []
+    for r in rows:
+        deliveries.append({
+            "id": str(r.id), "subscription_id": str(r.subscription_id) if r.subscription_id else None,
+            "event_type": r.event_type, "response_status": r.response_status,
+            "success": r.success, "duration_ms": r.duration_ms,
+            "delivered_at": r.delivered_at.isoformat() if r.delivered_at else None,
+        })
+    return {"deliveries": deliveries, "total": len(deliveries)}
+
+
+@app.post("/events/test")
+def test_event(subscription_id: str = Query(...), db: Session = Depends(get_db)):
+    """Send a test event to a subscription."""
+    try:
+        sub = db.execute(text(
+            "SELECT id, target_url, secret, event_type FROM webhook_subscriptions WHERE id = :sid"
+        ), {"sid": subscription_id}).fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lookup failed: {e}")
+
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    from tools.event_bus import publish_event
+    publish_event(sub.event_type, {"test": True, "message": "This is a test event"})
+    return {"sent": True, "subscription_id": subscription_id, "event_type": sub.event_type}
+
+
+@app.get("/events/types")
+def list_event_types():
+    """List all supported event types."""
+    from tools.event_bus import EVENT_TYPES
+    return {"event_types": EVENT_TYPES, "total": len(EVENT_TYPES)}
+
+
+# ── PHASE 7: Multi-Tenant Management ────────────────────────────
+
+
+@app.get("/tenants")
+def list_tenants(db: Session = Depends(get_db)):
+    """List all tenants."""
+    try:
+        rows = db.execute(text(
+            "SELECT * FROM tenants ORDER BY created_at DESC"
+        )).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+    tenants = []
+    for r in rows:
+        tenants.append({
+            "id": r.id, "name": r.name, "plan": r.plan,
+            "rate_limit_per_minute": r.rate_limit_per_minute,
+            "max_projects": r.max_projects, "max_api_keys": r.max_api_keys,
+            "features": r.features, "active": r.active,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return {"tenants": tenants, "total": len(tenants)}
+
+
+@app.get("/tenants/{tenant_id}")
+def get_tenant(tenant_id: str, db: Session = Depends(get_db)):
+    """Get tenant details with API key summary and project count."""
+    try:
+        tenant = db.execute(text("SELECT * FROM tenants WHERE id = :tid"), {"tid": tenant_id}).fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Count API keys
+    try:
+        key_count = db.execute(text(
+            "SELECT COUNT(*) FROM api_keys WHERE tenant_id = :tid AND revoked = false"
+        ), {"tid": tenant_id}).scalar() or 0
+    except Exception:
+        key_count = 0
+
+    # Count projects
+    try:
+        project_count = db.execute(text(
+            "SELECT COUNT(*) FROM projects WHERE tenant_id = :tid"
+        ), {"tid": tenant_id}).scalar() or 0
+    except Exception:
+        project_count = 0
+
+    return {
+        "id": tenant.id, "name": tenant.name, "plan": tenant.plan,
+        "rate_limit_per_minute": tenant.rate_limit_per_minute,
+        "max_projects": tenant.max_projects, "max_api_keys": tenant.max_api_keys,
+        "features": tenant.features, "active": tenant.active,
+        "api_key_count": key_count, "project_count": project_count,
+        "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
+    }
+
+
+@app.post("/tenants")
+def create_tenant(request: CreateTenantRequest, db: Session = Depends(get_db)):
+    """Create a new tenant."""
+    try:
+        db.execute(text(
+            "INSERT INTO tenants (id, name, plan, rate_limit_per_minute, max_projects, max_api_keys) "
+            "VALUES (:id, :name, :plan, :rl, :mp, :mk)"
+        ), {
+            "id": request.id, "name": request.name, "plan": request.plan,
+            "rl": request.rate_limit_per_minute, "mp": request.max_projects,
+            "mk": request.max_api_keys,
+        })
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Create failed: {e}")
+    return {"created": True, "tenant_id": request.id, "name": request.name, "plan": request.plan}
+
+
+@app.patch("/tenants/{tenant_id}")
+def update_tenant(tenant_id: str, request: UpdateTenantRequest, db: Session = Depends(get_db)):
+    """Update tenant settings."""
+    updates = []
+    params = {"tid": tenant_id}
+    if request.plan is not None:
+        updates.append("plan = :plan")
+        params["plan"] = request.plan
+    if request.rate_limit_per_minute is not None:
+        updates.append("rate_limit_per_minute = :rl")
+        params["rl"] = request.rate_limit_per_minute
+    if request.max_projects is not None:
+        updates.append("max_projects = :mp")
+        params["mp"] = request.max_projects
+    if request.max_api_keys is not None:
+        updates.append("max_api_keys = :mk")
+        params["mk"] = request.max_api_keys
+    if request.features is not None:
+        updates.append("features = :feat")
+        params["feat"] = str(request.features).replace("'", '"')
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    try:
+        db.execute(text(f"UPDATE tenants SET {', '.join(updates)} WHERE id = :tid"), params)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+    return {"updated": True, "tenant_id": tenant_id}
+
+
+@app.delete("/tenants/{tenant_id}")
+def delete_tenant(tenant_id: str, db: Session = Depends(get_db)):
+    """Soft-delete a tenant."""
+    if tenant_id == "default":
+        raise HTTPException(status_code=400, detail="Cannot delete default tenant")
+    try:
+        db.execute(text("UPDATE tenants SET active = false WHERE id = :tid"), {"tid": tenant_id})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+    return {"deleted": True, "tenant_id": tenant_id}
+
+
+@app.get("/tenants/{tenant_id}/usage")
+def tenant_usage(tenant_id: str, db: Session = Depends(get_db)):
+    """Usage stats for a tenant."""
+    try:
+        project_count = db.execute(text(
+            "SELECT COUNT(*) FROM projects WHERE tenant_id = :tid"
+        ), {"tid": tenant_id}).scalar() or 0
+    except Exception:
+        project_count = 0
+
+    try:
+        key_count = db.execute(text(
+            "SELECT COUNT(*) FROM api_keys WHERE tenant_id = :tid AND revoked = false"
+        ), {"tid": tenant_id}).scalar() or 0
+    except Exception:
+        key_count = 0
+
+    try:
+        jobs_today = db.execute(text(
+            "SELECT COUNT(*) FROM job_queue WHERE tenant_id = :tid AND created_at > now() - interval '24 hours'"
+        ), {"tid": tenant_id}).scalar() or 0
+    except Exception:
+        jobs_today = 0
+
+    try:
+        sub_count = db.execute(text(
+            "SELECT COUNT(*) FROM webhook_subscriptions WHERE tenant_id = :tid AND active = true"
+        ), {"tid": tenant_id}).scalar() or 0
+    except Exception:
+        sub_count = 0
+
+    # Get tenant limits
+    try:
+        tenant = db.execute(text("SELECT * FROM tenants WHERE id = :tid"), {"tid": tenant_id}).fetchone()
+    except Exception:
+        tenant = None
+
+    plan_limits = {}
+    if tenant:
+        plan_limits = {
+            "max_projects": tenant.max_projects,
+            "max_api_keys": tenant.max_api_keys,
+            "rate_limit_per_minute": tenant.rate_limit_per_minute,
+        }
+
+    return {
+        "tenant_id": tenant_id,
+        "project_count": project_count,
+        "api_key_count": key_count,
+        "jobs_today": jobs_today,
+        "subscriptions": sub_count,
+        "plan_limits": plan_limits,
+    }
