@@ -229,8 +229,8 @@ class TestNotificationSender:
             result = send_stall_alert("proj-123", days_stalled=3.5)
             assert result is not None
             call_data = mock_client.insert.call_args[0][1]
-            assert "3.5 days" in call_data[0]["title"]
-            assert call_data[0]["department"] == "operations"
+            assert "3.5 days" in call_data["title"]
+            assert call_data["department"] == "operations"
 
     def test_send_cost_alert_negative_margin(self):
         """send_cost_alert sends alert-level for negative margin."""
@@ -242,8 +242,8 @@ class TestNotificationSender:
             result = send_cost_alert("proj-123", margin_pct=-5.0)
             assert result is not None
             call_data = mock_client.insert.call_args[0][1]
-            assert call_data[0]["type"] == "alert"
-            assert "Negative margin" in call_data[0]["title"]
+            assert call_data["type"] == "alert"
+            assert "Negative margin" in call_data["title"]
 
     def test_send_cost_alert_low_margin(self):
         """send_cost_alert sends warning-level for low positive margin."""
@@ -255,7 +255,7 @@ class TestNotificationSender:
             result = send_cost_alert("proj-123", margin_pct=12.0)
             assert result is not None
             call_data = mock_client.insert.call_args[0][1]
-            assert call_data[0]["type"] == "warning"
+            assert call_data["type"] == "warning"
 
     def test_notification_no_client(self):
         """send_notification returns None when Supabase not configured."""

@@ -79,7 +79,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import os
-import anthropic
 
 from db.session import get_db, check_db
 from db.models import (
@@ -3528,6 +3527,7 @@ def persona_test(request: PersonaTestRequest, db: Session = Depends(get_db)):
 
     # Call Claude API
     try:
+        import anthropic
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -3536,7 +3536,9 @@ def persona_test(request: PersonaTestRequest, db: Session = Depends(get_db)):
             messages=[{"role": "user", "content": request.message.strip()}],
         )
         response_text = response.content[0].text
-    except anthropic.APIError as e:
+    except ImportError:
+        raise HTTPException(status_code=500, detail="anthropic package not installed")
+    except Exception as e:
         raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
 
     return {
