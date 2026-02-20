@@ -4427,3 +4427,96 @@ def admin_bulk_verify(request: BulkVerifyRequest, db: Session = Depends(get_db))
         "blueprint_score": score_100,
         "fix_instructions": fix_instructions,
     }
+
+
+# ── GET /admin/system-status ────────────────────────────────────
+
+
+@app.get("/admin/system-status")
+def admin_system_status(db: Session = Depends(get_db)):
+    """
+    Full platform snapshot: DB row counts, embeddings, registry,
+    pipeline stage counts, cost totals, and persona stats.
+    """
+    import json as _json
+
+    # ── DB row counts ──────────────────────────────────────────
+    table_counts = {}
+    for table in [
+        "client_context", "project_agent_state", "verification_runs",
+        "project_financials", "persona_feedback", "agent_handoffs",
+        "projects", "builds",
+    ]:
+        try:
+            row = db.execute(text(f"SELECT COUNT(*) AS cnt FROM {table}")).first()
+            table_counts[table] = int(row.cnt) if row else 0
+        except Exception:
+            table_counts[table] = -1  # Table may not exist
+
+    # ── Embeddings count ───────────────────────────────────────
+    embeddings_count = 0
+    try:
+        with open("data/embeddings.json", "r") as f:
+            store = _json.load(f)
+            embeddings_count = len(store.get("documents", []))
+    except Exception:
+        pass
+
+    # ── Registry ───────────────────────────────────────────────
+    registry_modules = _registry.get("module_count", 0)
+
+    # ── Pipeline stage counts ──────────────────────────────────
+    pipeline_counts = {}
+    try:
+        rows = db.execute(text(
+            "SELECT current_stage, COUNT(*) AS cnt FROM project_agent_state GROUP BY current_stage"
+        )).fetchall()
+        pipeline_counts = {r.current_stage: int(r.cnt) for r in rows}
+    except Exception:
+        pass
+
+    # ── Costs ──────────────────────────────────────────────────
+    cost_stats = {"total_spend": 0, "avg_margin_pct": 0}
+    try:
+        row = db.execute(text("""
+            SELECT
+                COALESCE(SUM(pf.cost_usd), 0) AS total_spend,
+                COALESCE(SUM(p.revenue), 0) AS total_revenue
+            FROM projects p
+            LEFT JOIN project_financials pf ON pf.project_id = p.id
+        """)).first()
+        if row:
+            spend = float(row.total_spend)
+            revenue = float(row.total_revenue)
+            margin = ((revenue - spend) / revenue * 100) if revenue > 0 else 0
+            cost_stats = {
+                "total_spend": round(spend, 4),
+                "total_revenue": round(revenue, 2),
+                "avg_margin_pct": round(margin, 1),
+            }
+    except Exception:
+        pass
+
+    # ── Persona stats ──────────────────────────────────────────
+    persona_stats = {}
+    try:
+        rows = db.execute(text(
+            "SELECT persona, AVG(rating) AS avg_rating, COUNT(*) AS cnt "
+            "FROM persona_feedback GROUP BY persona"
+        )).fetchall()
+        persona_stats = {
+            r.persona: {"avg_rating": round(float(r.avg_rating), 2), "total_feedback": int(r.cnt)}
+            for r in rows
+        }
+    except Exception:
+        pass
+
+    return {
+        "status": "operational",
+        "db": table_counts,
+        "embeddings": {"document_count": embeddings_count},
+        "registry": {"module_count": registry_modules},
+        "pipeline": pipeline_counts,
+        "costs": cost_stats,
+        "personas": persona_stats,
+    }
