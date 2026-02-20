@@ -2733,6 +2733,133 @@ def health_repair(db: Session = Depends(get_db)):
     }
 
 
+@app.post("/command")
+def command(request: CommandRequest, db: Session = Depends(get_db)):
+    """
+    Natural language command interface.
+
+    Accepts a free-text command and routes it to the appropriate endpoint
+    internally. Supports commands like:
+    - "check health" → GET /health/full
+    - "show costs for Acme" → GET /costs/summary
+    - "find similar to CRM integration" → GET /similar
+    - "show stalled projects" → GET /supervisor/stalled
+    - "deploy status for <project>" → GET /deploy/status
+    - "estimate cost for email automation" → POST /costs/estimate
+    - "pipeline status for <project>" → GET /pipeline/status
+    - "memory stats" → GET /health/memory
+    - "repair platform" → POST /health/repair
+    """
+    cmd = request.command.strip().lower()
+    customer = request.customer_name
+
+    # Route based on keyword matching
+    if any(kw in cmd for kw in ["health", "status check", "system check"]):
+        if "memory" in cmd or "embedding" in cmd:
+            return {"routed_to": "/health/memory", "result": health_memory()}
+        return {"routed_to": "/health/full", "result": health_full(db=db)}
+
+    if any(kw in cmd for kw in ["repair", "fix", "heal", "self-heal"]):
+        return {"routed_to": "/health/repair", "result": health_repair(db=db)}
+
+    if any(kw in cmd for kw in ["stalled", "stuck", "blocked", "inactive"]):
+        return {"routed_to": "/supervisor/stalled", "result": supervisor_stalled(db=db)}
+
+    if any(kw in cmd for kw in ["cost", "spending", "expense", "margin"]):
+        if any(kw in cmd for kw in ["estimate", "predict", "forecast"]):
+            desc = cmd
+            for prefix in ["estimate cost for ", "estimate ", "predict cost for ", "forecast "]:
+                if cmd.startswith(prefix):
+                    desc = cmd[len(prefix):]
+                    break
+            req = CostEstimateRequest(description=desc)
+            return {"routed_to": "/costs/estimate", "result": costs_estimate(req, db=db)}
+
+        if any(kw in cmd for kw in ["report", "weekly"]):
+            cid = customer or _extract_name_from_command(cmd)
+            if not cid:
+                return {"error": "Please specify a customer name", "hint": "Try: 'weekly cost report for [customer]'"}
+            return {"routed_to": "/costs/report", "result": costs_report(client_id=cid, db=db)}
+
+        cid = customer or _extract_name_from_command(cmd)
+        if not cid:
+            return {"error": "Please specify a customer name", "hint": "Try: 'show costs for [customer]'"}
+        return {"routed_to": "/costs/summary", "result": costs_summary(client_id=cid, db=db)}
+
+    if any(kw in cmd for kw in ["similar", "find like", "match", "compare"]):
+        desc = cmd
+        for prefix in ["find similar to ", "find projects like ", "similar to ", "match "]:
+            if cmd.startswith(prefix):
+                desc = cmd[len(prefix):]
+                break
+        return {"routed_to": "/similar", "result": similar(description=desc)}
+
+    if "deploy" in cmd:
+        if "status" in cmd:
+            pid = _extract_uuid_from_command(cmd)
+            if not pid:
+                return {"error": "Please specify a project_id", "hint": "Try: 'deploy status for [project_id]'"}
+            return {"routed_to": "/deploy/status", "result": deploy_status(project_id=pid, db=db)}
+        return {"hint": "Deployment requires structured input. Use POST /deploy/makecom or POST /deploy/n8n directly."}
+
+    if "pipeline" in cmd:
+        pid = _extract_uuid_from_command(cmd)
+        if not pid:
+            return {"error": "Please specify a project_id", "hint": "Try: 'pipeline status for [project_id]'"}
+        return {"routed_to": "/pipeline/status", "result": pipeline_status(project_id=pid, db=db)}
+
+    if any(kw in cmd for kw in ["confidence", "verification", "verify history"]):
+        pid = _extract_uuid_from_command(cmd)
+        if not pid:
+            return {"error": "Please specify a project_id", "hint": "Try: 'confidence history for [project_id]'"}
+        return {"routed_to": "/confidence/history", "result": confidence_history(project_id=pid, db=db)}
+
+    if any(kw in cmd for kw in ["memory", "context", "learning"]):
+        if "stats" in cmd or "health" in cmd:
+            return {"routed_to": "/health/memory", "result": health_memory()}
+        return {"hint": "Memory operations require structured input. Use POST /memory or GET /memory directly."}
+
+    return {
+        "error": "Command not recognized",
+        "command_received": request.command,
+        "available_commands": [
+            "check health",
+            "memory stats",
+            "repair platform",
+            "show stalled projects",
+            "show costs for [customer]",
+            "weekly cost report for [customer]",
+            "estimate cost for [description]",
+            "find similar to [description]",
+            "deploy status for [project_id]",
+            "pipeline status for [project_id]",
+            "confidence history for [project_id]",
+        ],
+    }
+
+
+def _extract_name_from_command(cmd: str) -> str | None:
+    """Extract a customer/project name from a command string."""
+    for prep in [" for ", " of ", " from "]:
+        if prep in cmd:
+            return cmd.split(prep, 1)[1].strip().strip("'\"")
+    return None
+
+
+def _extract_uuid_from_command(cmd: str) -> str | None:
+    """Extract a UUID-like string from a command."""
+    import re
+    match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", cmd)
+    if match:
+        return match.group(0)
+    for prep in [" for ", " of "]:
+        if prep in cmd:
+            candidate = cmd.split(prep, 1)[1].strip().strip("'\"")
+            if candidate:
+                return candidate
+    return None
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
