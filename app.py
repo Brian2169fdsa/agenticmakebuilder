@@ -4129,3 +4129,72 @@ def verify_auto(request: VerifyAutoRequest, db: Session = Depends(get_db)):
         result["next_stage"] = next_stage
 
     return result
+
+
+# ── GET /confidence/trend ───────────────────────────────────────
+
+
+@app.get("/confidence/trend")
+def confidence_trend(project_id: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Confidence score trend for a project over time.
+
+    Queries verification_runs ordered by created_at and returns the list
+    plus overall trend (improving, declining, stable).
+    """
+    try:
+        project_uuid = UUID(project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    try:
+        rows = db.execute(text("""
+            SELECT confidence_score, passed, error_count, warning_count, created_at
+            FROM verification_runs
+            WHERE project_id = :pid
+            ORDER BY created_at ASC
+        """), {"pid": str(project_uuid)}).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    entries = [
+        {
+            "confidence_score": float(r.confidence_score),
+            "passed": r.passed,
+            "error_count": int(r.error_count) if r.error_count else 0,
+            "warning_count": int(r.warning_count) if r.warning_count else 0,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+    if not entries:
+        return {
+            "project_id": project_id,
+            "entries": [],
+            "trend": "no_data",
+            "latest_score": None,
+            "first_score": None,
+            "total_runs": 0,
+        }
+
+    first_score = entries[0]["confidence_score"]
+    latest_score = entries[-1]["confidence_score"]
+
+    if len(entries) == 1:
+        trend = "stable"
+    elif latest_score > first_score + 5:
+        trend = "improving"
+    elif latest_score < first_score - 5:
+        trend = "declining"
+    else:
+        trend = "stable"
+
+    return {
+        "project_id": project_id,
+        "entries": entries,
+        "trend": trend,
+        "latest_score": latest_score,
+        "first_score": first_score,
+        "total_runs": len(entries),
+    }
