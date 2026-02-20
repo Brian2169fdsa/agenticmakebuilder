@@ -1087,6 +1087,31 @@ def costs_track(request: CostTrackRequest, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to store cost record: {str(e)}")
 
+    # Auto-calculate cumulative cost and margin for the project
+    cumulative_cost = db.execute(text(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM project_financials WHERE project_id = :pid"
+    ), {"pid": str(project_uuid)}).scalar()
+    cumulative_cost = float(cumulative_cost)
+
+    revenue = float(project.revenue or 0)
+    margin = revenue - cumulative_cost
+    margin_pct = (margin / revenue * 100) if revenue > 0 else 0.0
+
+    # Check if cost exceeds estimate by 20%+ (alert threshold)
+    cost_alert = None
+    if revenue > 0 and cumulative_cost > revenue * 0.8:
+        overage_pct = round((cumulative_cost / revenue - 0.8) * 100, 1)
+        if cumulative_cost > revenue:
+            cost_alert = {
+                "level": "critical",
+                "message": f"Cost ({cumulative_cost:.4f}) exceeds revenue ({revenue:.2f}). Margin is negative.",
+            }
+        else:
+            cost_alert = {
+                "level": "warning",
+                "message": f"Cost is within 20% of revenue. Current margin: {margin_pct:.1f}%",
+            }
+
     return {
         "id": str(record.id),
         "project_id": str(record.project_id),
@@ -1095,6 +1120,11 @@ def costs_track(request: CostTrackRequest, db: Session = Depends(get_db)):
         "output_tokens": record.output_tokens,
         "operation_type": record.operation_type,
         "cost_usd": record.cost_usd,
+        "cumulative_cost": round(cumulative_cost, 4),
+        "revenue": round(revenue, 2),
+        "margin": round(margin, 4),
+        "margin_pct": round(margin_pct, 1),
+        "cost_alert": cost_alert,
         "created_at": record.created_at.isoformat(),
     }
 
@@ -1183,6 +1213,194 @@ def costs_summary(client_id: str = Query(..., description="Customer name or proj
             "total_output_tokens": total_output_tokens,
         },
         "projects": projects,
+    }
+
+
+@app.get("/costs/report")
+def costs_report(
+    client_id: str = Query(..., description="Customer name"),
+    weeks: int = Query(4, ge=1, le=52),
+    db: Session = Depends(get_db),
+):
+    """
+    Weekly cost report in markdown format.
+
+    Returns a markdown table of weekly costs, token usage, and margin trends
+    for the given client over the last N weeks.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT
+                date_trunc('week', pf.created_at) AS week_start,
+                COUNT(pf.id) AS operations,
+                COALESCE(SUM(pf.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(pf.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(pf.cost_usd), 0) AS total_cost,
+                STRING_AGG(DISTINCT pf.model, ', ') AS models_used
+            FROM project_financials pf
+            JOIN projects p ON p.id = pf.project_id
+            WHERE (LOWER(p.customer_name) = LOWER(:client_id)
+                   OR LOWER(p.name) = LOWER(:client_id))
+              AND pf.created_at >= NOW() - INTERVAL ':weeks weeks'
+            GROUP BY date_trunc('week', pf.created_at)
+            ORDER BY week_start DESC
+        """).bindparams(weeks=weeks), {"client_id": client_id.strip()}).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    # Get total revenue for margin calculation
+    revenue_row = db.execute(text("""
+        SELECT COALESCE(SUM(revenue), 0) AS total_revenue
+        FROM projects
+        WHERE LOWER(customer_name) = LOWER(:client_id) OR LOWER(name) = LOWER(:client_id)
+    """), {"client_id": client_id.strip()}).first()
+    total_revenue = float(revenue_row.total_revenue) if revenue_row else 0.0
+
+    # Build markdown report
+    lines = [
+        f"# Weekly Cost Report — {client_id}",
+        f"",
+        f"**Period:** Last {weeks} weeks  ",
+        f"**Total Revenue:** ${total_revenue:,.2f}",
+        f"",
+        f"| Week | Operations | Input Tokens | Output Tokens | Cost (USD) | Models |",
+        f"|------|-----------|-------------|--------------|-----------|--------|",
+    ]
+
+    cumulative_cost = 0.0
+    weekly_data = []
+    for row in rows:
+        week_label = row.week_start.strftime("%Y-%m-%d") if row.week_start else "N/A"
+        cost = float(row.total_cost)
+        cumulative_cost += cost
+        lines.append(
+            f"| {week_label} | {row.operations} | {int(row.input_tokens):,} | "
+            f"{int(row.output_tokens):,} | ${cost:.4f} | {row.models_used or 'N/A'} |"
+        )
+        weekly_data.append({
+            "week": week_label,
+            "operations": int(row.operations),
+            "input_tokens": int(row.input_tokens),
+            "output_tokens": int(row.output_tokens),
+            "cost_usd": round(cost, 4),
+            "models": row.models_used or "",
+        })
+
+    overall_margin = total_revenue - cumulative_cost
+    margin_pct = (overall_margin / total_revenue * 100) if total_revenue > 0 else 0.0
+
+    lines.extend([
+        f"",
+        f"**Cumulative Cost:** ${cumulative_cost:,.4f}  ",
+        f"**Margin:** ${overall_margin:,.4f} ({margin_pct:.1f}%)",
+    ])
+
+    return {
+        "client_id": client_id,
+        "weeks": weeks,
+        "total_revenue": round(total_revenue, 2),
+        "cumulative_cost": round(cumulative_cost, 4),
+        "margin": round(overall_margin, 4),
+        "margin_pct": round(margin_pct, 1),
+        "weekly_data": weekly_data,
+        "markdown": "\n".join(lines),
+    }
+
+
+@app.post("/costs/estimate")
+def costs_estimate(request: CostEstimateRequest, db: Session = Depends(get_db)):
+    """
+    Pre-build cost estimation based on historical project data.
+
+    Analyzes past projects with similar descriptions to estimate the likely
+    token usage and cost for a new build. Uses TF-IDF similarity to find
+    comparable past projects and averages their cost profiles.
+    """
+    from tools.embedding_engine import find_similar
+
+    # Find similar past projects
+    similar = find_similar(request.description, top_n=5)
+
+    if not similar:
+        # No historical data — use category-based defaults
+        defaults = {
+            "simple": {"input_tokens": 5_000, "output_tokens": 10_000, "ops": 3},
+            "standard": {"input_tokens": 15_000, "output_tokens": 30_000, "ops": 6},
+            "complex": {"input_tokens": 40_000, "output_tokens": 80_000, "ops": 10},
+            "enterprise": {"input_tokens": 100_000, "output_tokens": 200_000, "ops": 20},
+        }
+        profile = defaults.get(request.category, defaults["standard"])
+
+        # Estimate cost using mid-tier model (sonnet)
+        mid_pricing = _MODEL_PRICING.get("claude-sonnet-4-6", {"input": 3.0 / 1_000_000, "output": 15.0 / 1_000_000})
+        estimated_cost = (
+            profile["input_tokens"] * mid_pricing["input"]
+            + profile["output_tokens"] * mid_pricing["output"]
+        )
+
+        return {
+            "source": "category_default",
+            "category": request.category,
+            "estimated_operations": profile["ops"],
+            "estimated_input_tokens": profile["input_tokens"],
+            "estimated_output_tokens": profile["output_tokens"],
+            "estimated_cost_usd": round(estimated_cost, 4),
+            "confidence": "low",
+            "similar_projects": [],
+        }
+
+    # Get cost data for similar project IDs
+    project_ids = [s["id"] for s in similar]
+    placeholders = ", ".join([f":pid{i}" for i in range(len(project_ids))])
+    params = {f"pid{i}": pid for i, pid in enumerate(project_ids)}
+
+    try:
+        rows = db.execute(text(f"""
+            SELECT
+                project_id,
+                COUNT(*) AS ops,
+                COALESCE(SUM(input_tokens), 0) AS total_input,
+                COALESCE(SUM(output_tokens), 0) AS total_output,
+                COALESCE(SUM(cost_usd), 0) AS total_cost
+            FROM project_financials
+            WHERE project_id::text IN ({placeholders})
+            GROUP BY project_id
+        """), params).fetchall()
+    except Exception:
+        rows = []
+
+    if not rows:
+        # Similar projects found but no cost history
+        mid_pricing = _MODEL_PRICING.get("claude-sonnet-4-6", {"input": 3.0 / 1_000_000, "output": 15.0 / 1_000_000})
+        defaults = {"simple": 10_000, "standard": 30_000, "complex": 80_000, "enterprise": 200_000}
+        est_tokens = defaults.get(request.category, 30_000)
+        return {
+            "source": "similar_projects_no_cost_data",
+            "estimated_operations": 5,
+            "estimated_input_tokens": est_tokens // 2,
+            "estimated_output_tokens": est_tokens,
+            "estimated_cost_usd": round(est_tokens * mid_pricing["output"], 4),
+            "confidence": "low",
+            "similar_projects": [{"id": s["id"], "score": s["score"]} for s in similar[:3]],
+        }
+
+    # Average across similar projects with cost data
+    avg_ops = sum(r.ops for r in rows) / len(rows)
+    avg_input = sum(int(r.total_input) for r in rows) / len(rows)
+    avg_output = sum(int(r.total_output) for r in rows) / len(rows)
+    avg_cost = sum(float(r.total_cost) for r in rows) / len(rows)
+
+    conf = "high" if len(rows) >= 3 else ("medium" if len(rows) >= 2 else "low")
+
+    return {
+        "source": "historical_average",
+        "based_on_projects": len(rows),
+        "estimated_operations": round(avg_ops),
+        "estimated_input_tokens": round(avg_input),
+        "estimated_output_tokens": round(avg_output),
+        "estimated_cost_usd": round(avg_cost, 4),
+        "confidence": conf,
+        "similar_projects": [{"id": s["id"], "score": s["score"]} for s in similar[:3]],
     }
 
 
