@@ -118,6 +118,7 @@ class AuditRequest(BaseModel):
 class VerifyRequest(BaseModel):
     """Verify a blueprint JSON against the full 77-rule validation audit."""
     blueprint: dict                        # Make.com export JSON
+    project_id: Optional[str] = None       # If set, logs run + auto-advances pipeline
 
 
 class HandoffRequest(BaseModel):
@@ -427,7 +428,7 @@ def audit(request: AuditRequest):
 
 
 @app.post("/verify")
-def verify(request: VerifyRequest):
+def verify(request: VerifyRequest, db: Session = Depends(get_db)):
     """
     Full 77-rule blueprint validation audit.
 
@@ -435,8 +436,10 @@ def verify(request: VerifyRequest):
     a blueprint. Returns confidence_score (0-100), pass/fail verdict, and
     specific fix_instructions when confidence < 85.
 
-    Designed for the multi-agent build pipeline — the Builder agent submits
-    its output here and receives actionable repair instructions.
+    If project_id is provided:
+    - Logs the run to verification_runs table
+    - If confidence >= 85 and no errors, auto-calls agent/complete with success
+    - fix_instructions are ranked by impact (errors first, then warnings)
     """
     blueprint = request.blueprint
 
@@ -452,8 +455,7 @@ def verify(request: VerifyRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export validation failed: {str(e)}")
 
-    # Run canonical spec validation if the blueprint embeds a spec
-    # Otherwise run a supplementary structural audit (47 additional checks)
+    # Run supplementary structural audit (47 additional checks)
     canonical_report = _run_supplementary_checks(blueprint, _registry)
 
     # Merge both reports
@@ -475,12 +477,58 @@ def verify(request: VerifyRequest):
 
     passed = score_100 >= 85 and len(all_errors) == 0
 
-    # Generate fix instructions if confidence < 85
+    # Generate fix instructions ranked by impact if not passed
     fix_instructions = []
     if not passed:
         fix_instructions = _generate_fix_instructions(all_errors, all_warnings, score_100)
 
-    return {
+    # Log verification run and auto-advance pipeline if project_id provided
+    auto_advanced = False
+    if request.project_id:
+        try:
+            project_uuid = UUID(request.project_id)
+            run = VerificationRun(
+                project_id=project_uuid,
+                confidence_score=score_100,
+                passed=passed,
+                error_count=len(all_errors),
+                warning_count=len(all_warnings),
+                fix_instructions=fix_instructions if fix_instructions else None,
+            )
+            db.add(run)
+            db.commit()
+
+            # Auto-advance pipeline if passed
+            if passed:
+                state = db.query(ProjectAgentState).filter(
+                    ProjectAgentState.project_id == project_uuid
+                ).first()
+                if state and state.current_stage == "verify":
+                    handoff = AgentHandoff(
+                        from_agent="validator",
+                        to_agent="deployer",
+                        project_id=project_uuid,
+                        context_bundle={"outcome": "success", "confidence_score": score_100},
+                    )
+                    db.add(handoff)
+                    state.current_stage = "deploy"
+                    state.current_agent = "deployer"
+                    state.updated_at = datetime.now(timezone.utc)
+                    history = state.stage_history or []
+                    history.append({
+                        "stage": "verify",
+                        "agent": "validator",
+                        "outcome": "success",
+                        "confidence_score": score_100,
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    state.stage_history = history
+                    db.commit()
+                    auto_advanced = True
+        except Exception:
+            db.rollback()
+
+    result = {
         "confidence_score": score_100,
         "passed": passed,
         "grade": confidence["grade"],
@@ -498,6 +546,10 @@ def verify(request: VerifyRequest):
         ],
         "fix_instructions": fix_instructions,
     }
+    if auto_advanced:
+        result["auto_advanced"] = True
+        result["next_stage"] = "deploy"
+    return result
 
 
 def _run_supplementary_checks(blueprint, registry):
@@ -1744,6 +1796,220 @@ def similar(description: str = Query(..., min_length=3), top_n: int = Query(3, g
             }
             for r in results
         ],
+    }
+
+
+@app.post("/verify/loop")
+def verify_loop(request: VerifyLoopRequest, db: Session = Depends(get_db)):
+    """
+    Iterative verify → fix → verify cycle.
+
+    Runs blueprint through the 77-rule audit up to max_iterations times.
+    After each failing iteration, auto-generates fix instructions and applies
+    rule-based patches before re-running. Stops early if confidence >= 85
+    and error count reaches 0.
+
+    Returns the full iteration history plus final verdict.
+    """
+    blueprint = request.blueprint
+    max_iters = min(request.max_iterations or 3, 5)  # cap at 5
+    project_uuid = UUID(request.project_id) if request.project_id else None
+
+    iterations = []
+
+    for i in range(1, max_iters + 1):
+        # Run validation
+        try:
+            export_report = validate_make_export(blueprint, _registry)
+        except Exception as e:
+            iterations.append({"iteration": i, "error": str(e)})
+            break
+
+        canonical_report = _run_supplementary_checks(blueprint, _registry)
+        all_errors = export_report.get("errors", []) + canonical_report.get("errors", [])
+        all_warnings = export_report.get("warnings", []) + canonical_report.get("warnings", [])
+        merged = {
+            "errors": all_errors,
+            "warnings": all_warnings,
+            "checks_run": export_report.get("checks_run", 0) + canonical_report.get("checks_run", 0),
+            "checks_passed": export_report.get("checks_passed", 0) + canonical_report.get("checks_passed", 0),
+        }
+
+        confidence = compute_confidence(merged, agent_notes=[], retry_count=i - 1)
+        score_100 = round(confidence["score"] * 100, 1)
+        passed = score_100 >= 85 and len(all_errors) == 0
+
+        fix_instructions = []
+        if not passed:
+            fix_instructions = _generate_fix_instructions(all_errors, all_warnings, score_100)
+
+        iteration_record = {
+            "iteration": i,
+            "confidence_score": score_100,
+            "grade": confidence["grade"],
+            "error_count": len(all_errors),
+            "warning_count": len(all_warnings),
+            "passed": passed,
+            "fixes_applied": [],
+        }
+
+        # Log to verification_runs
+        if project_uuid:
+            try:
+                run = VerificationRun(
+                    project_id=project_uuid,
+                    confidence_score=score_100,
+                    passed=passed,
+                    error_count=len(all_errors),
+                    warning_count=len(all_warnings),
+                    fix_instructions=fix_instructions if fix_instructions else None,
+                    iteration=i,
+                )
+                db.add(run)
+                db.commit()
+            except Exception:
+                db.rollback()
+
+        iterations.append(iteration_record)
+
+        if passed:
+            break
+
+        # Apply rule-based auto-fixes to the blueprint for the next iteration
+        fixes_applied = _auto_fix_blueprint(blueprint, all_errors)
+        iteration_record["fixes_applied"] = fixes_applied
+        if not fixes_applied:
+            break  # No more auto-fixable issues
+
+    final = iterations[-1] if iterations else {}
+
+    # Auto-advance pipeline on final success
+    auto_advanced = False
+    if final.get("passed") and project_uuid:
+        try:
+            state = db.query(ProjectAgentState).filter(
+                ProjectAgentState.project_id == project_uuid
+            ).first()
+            if state and state.current_stage == "verify":
+                handoff = AgentHandoff(
+                    from_agent="validator",
+                    to_agent="deployer",
+                    project_id=project_uuid,
+                    context_bundle={"outcome": "success", "confidence_score": final.get("confidence_score")},
+                )
+                db.add(handoff)
+                state.current_stage = "deploy"
+                state.current_agent = "deployer"
+                state.updated_at = datetime.now(timezone.utc)
+                history = state.stage_history or []
+                history.append({
+                    "stage": "verify",
+                    "agent": "validator",
+                    "outcome": "success",
+                    "iterations": len(iterations),
+                    "final_confidence": final.get("confidence_score"),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                state.stage_history = history
+                db.commit()
+                auto_advanced = True
+        except Exception:
+            db.rollback()
+
+    result = {
+        "project_id": request.project_id,
+        "total_iterations": len(iterations),
+        "final_passed": final.get("passed", False),
+        "final_confidence": final.get("confidence_score", 0),
+        "final_grade": final.get("grade", "F"),
+        "iterations": iterations,
+    }
+    if auto_advanced:
+        result["auto_advanced"] = True
+        result["next_stage"] = "deploy"
+    return result
+
+
+def _auto_fix_blueprint(blueprint: dict, errors: list) -> list[str]:
+    """Apply rule-based auto-fixes to a blueprint based on validation errors.
+
+    Returns list of fix descriptions applied. Mutates the blueprint in place.
+    """
+    fixes = []
+    modules = blueprint.get("flow", blueprint.get("modules", []))
+    if not isinstance(modules, list):
+        return fixes
+
+    for err in errors:
+        rule_id = err.get("rule_id", "")
+        msg = err.get("message", "").lower()
+
+        # Fix: missing error handler
+        if "error" in rule_id.lower() and "handler" in msg:
+            for mod in modules:
+                if isinstance(mod, dict) and "error_handler" not in mod:
+                    mod["error_handler"] = {"type": "ignore"}
+                    fixes.append(f"Added default error handler to module '{mod.get('name', 'unknown')}'")
+
+        # Fix: missing module name
+        if "name" in msg and "missing" in msg:
+            for idx, mod in enumerate(modules):
+                if isinstance(mod, dict) and not mod.get("name"):
+                    mod["name"] = f"Module_{idx + 1}"
+                    fixes.append(f"Added default name to module at index {idx}")
+
+        # Fix: empty description
+        if "description" in msg and ("empty" in msg or "missing" in msg):
+            if not blueprint.get("description"):
+                blueprint["description"] = "Auto-generated scenario"
+                fixes.append("Added default scenario description")
+
+    return fixes
+
+
+@app.get("/confidence/history")
+def confidence_history(project_id: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Get all verification runs for a project with confidence score trend.
+    Returns runs ordered by creation time with delta between consecutive runs.
+    """
+    project_uuid = UUID(project_id)
+
+    runs = db.query(VerificationRun).filter(
+        VerificationRun.project_id == project_uuid
+    ).order_by(VerificationRun.created_at.asc()).all()
+
+    history = []
+    prev_score = None
+    for run in runs:
+        entry = {
+            "id": str(run.id),
+            "iteration": run.iteration,
+            "confidence_score": run.confidence_score,
+            "passed": run.passed,
+            "error_count": run.error_count,
+            "warning_count": run.warning_count,
+            "delta": round(run.confidence_score - prev_score, 1) if prev_score is not None else None,
+            "created_at": run.created_at.isoformat() if run.created_at else None,
+        }
+        history.append(entry)
+        prev_score = run.confidence_score
+
+    trend = "stable"
+    if len(history) >= 2:
+        first = history[0]["confidence_score"]
+        last = history[-1]["confidence_score"]
+        if last - first > 5:
+            trend = "improving"
+        elif first - last > 5:
+            trend = "declining"
+
+    return {
+        "project_id": project_id,
+        "total_runs": len(history),
+        "trend": trend,
+        "current_confidence": history[-1]["confidence_score"] if history else None,
+        "history": history,
     }
 
 
