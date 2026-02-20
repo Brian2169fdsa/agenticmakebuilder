@@ -1,7 +1,7 @@
 """
-Agentic Make Builder — FastAPI Application (v2.3.0)
+Agentic Make Builder — FastAPI Application (v3.0.0)
 
-Endpoints (59 total):
+Endpoints (79 total):
 
   Core Pipeline:
     GET  /health              — liveness probe
@@ -87,6 +87,36 @@ Endpoints (59 total):
   Natural Language:
     POST /command             — route free-text commands to endpoints
 
+  Authentication (4):
+    POST /auth/keys           — create API key (shown once)
+    GET  /auth/keys           — list all API keys
+    DELETE /auth/keys/{id}    — revoke API key
+    POST /auth/keys/rotate    — rotate key (revoke old, create new)
+
+  Job Queue (6):
+    POST /jobs/enqueue        — enqueue background job
+    GET  /jobs/list           — list jobs with filters
+    GET  /jobs/stats          — queue statistics
+    GET  /jobs/{job_id}       — get job status and result
+    DELETE /jobs/{id}/cancel  — cancel pending job
+    POST /jobs/cleanup        — remove old completed jobs
+
+  Event Bus (6):
+    POST /events/subscribe    — subscribe to platform events
+    DELETE /events/subscriptions/{id} — deactivate subscription
+    GET  /events/subscriptions — list webhook subscriptions
+    GET  /events/deliveries   — list recent deliveries
+    POST /events/test         — fire test event to subscriber
+    GET  /events/types        — list all event types
+
+  Multi-Tenant (7):
+    GET  /tenants             — list all tenants
+    GET  /tenants/{id}        — tenant details + counts
+    POST /tenants             — create tenant
+    PATCH /tenants/{id}       — update tenant settings
+    DELETE /tenants/{id}      — soft-delete tenant
+    GET  /tenants/{id}/usage  — usage stats per tenant
+
 HTTP status codes:
   200 — success
   400 — malformed request / missing required fields
@@ -158,7 +188,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Agentic Make Builder",
-    version="2.3.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
