@@ -1071,3 +1071,54 @@ def persona_context(
         "created_at": record.created_at.isoformat(),
         "updated_at": record.updated_at.isoformat(),
     }
+
+
+# ─────────────────────────────────────────
+# POST /persona/feedback
+# ─────────────────────────────────────────
+
+class PersonaFeedbackRequest(BaseModel):
+    persona: str
+    client_id: str
+    interaction_id: str
+    rating: int
+    notes: Optional[str] = None
+
+
+@app.post("/persona/feedback")
+def persona_feedback(request: PersonaFeedbackRequest, db: Session = Depends(get_db)):
+    """
+    Store feedback for a persona interaction.
+    Accepts persona, client_id, interaction_id, rating (1-5), and optional notes.
+    Used to improve persona responses over time.
+    """
+    persona = _validate_persona(request.persona)
+
+    if not request.client_id.strip():
+        raise HTTPException(status_code=400, detail="client_id is required")
+    if not request.interaction_id.strip():
+        raise HTTPException(status_code=400, detail="interaction_id is required")
+    if not 1 <= request.rating <= 5:
+        raise HTTPException(status_code=400, detail="rating must be between 1 and 5")
+
+    record = PersonaFeedback(
+        persona=persona,
+        client_id=request.client_id.strip(),
+        interaction_id=request.interaction_id.strip(),
+        rating=request.rating,
+        notes=request.notes,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    return {
+        "id": str(record.id),
+        "persona": record.persona,
+        "client_id": record.client_id,
+        "interaction_id": record.interaction_id,
+        "rating": record.rating,
+        "notes": record.notes,
+        "created_at": record.created_at.isoformat(),
+    }
