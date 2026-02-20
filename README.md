@@ -130,6 +130,8 @@ curl http://localhost:8000/health
 | `MANAGEAI_HOURLY_RATE` | No | Hourly rate for SOW estimates (default: `150`) |
 | `MONITOR_INTERVAL` | No | Execution poller interval in seconds (default: `900`) |
 | `MONITOR_LOOKBACK` | No | Number of recent executions to check (default: `20`) |
+| `SUPABASE_URL` | No | connect-hub Supabase project URL for real-time sync |
+| `SUPABASE_SERVICE_KEY` | No | Service role key for server-side writes to Supabase |
 
 ## Architecture
 
