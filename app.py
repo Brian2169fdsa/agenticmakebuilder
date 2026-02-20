@@ -3735,3 +3735,113 @@ def clients_list(db: Session = Depends(get_db)):
         })
 
     return {"clients": clients, "total": len(clients)}
+
+
+# ── POST /pipeline/advance ──────────────────────────────────────
+
+
+class PipelineAdvanceRequest(BaseModel):
+    project_id: str
+    force_stage: Optional[str] = None
+
+
+@app.post("/pipeline/advance")
+def pipeline_advance(request: PipelineAdvanceRequest, db: Session = Depends(get_db)):
+    """
+    Advance a project to the next pipeline stage.
+
+    Determines next stage from [intake, build, verify, deploy].
+    Optionally force to a specific stage. Updates project_agent_state
+    and calls pipeline_sync if available.
+    """
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    state = db.query(ProjectAgentState).filter(
+        ProjectAgentState.project_id == project_uuid
+    ).first()
+
+    now = datetime.now(timezone.utc)
+    old_stage = state.current_stage if state else "intake"
+
+    if request.force_stage:
+        if request.force_stage not in _STAGE_ORDER:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid stage '{request.force_stage}'. Must be one of: {', '.join(_STAGE_ORDER)}",
+            )
+        new_stage = request.force_stage
+    else:
+        stage_idx = _STAGE_ORDER.index(old_stage) if old_stage in _STAGE_ORDER else 0
+        if stage_idx >= len(_STAGE_ORDER) - 1:
+            return {
+                "project_id": str(project_uuid),
+                "old_stage": old_stage,
+                "new_stage": old_stage,
+                "message": "Project is already at final stage (deploy)",
+                "advanced_at": now.isoformat(),
+            }
+        new_stage = _STAGE_ORDER[stage_idx + 1]
+
+    new_agent = _STAGE_AGENT_MAP.get(new_stage, "supervisor")
+
+    if state:
+        state.current_stage = new_stage
+        state.current_agent = new_agent
+        state.updated_at = now
+        history = state.stage_history or []
+        history.append({
+            "stage": new_stage,
+            "agent": new_agent,
+            "started_at": now.isoformat(),
+            "advanced_from": old_stage,
+        })
+        state.stage_history = history
+    else:
+        state = ProjectAgentState(
+            project_id=project_uuid,
+            current_stage=new_stage,
+            current_agent=new_agent,
+            started_at=now,
+            updated_at=now,
+            pipeline_health="on_track",
+            stage_history=[{
+                "stage": new_stage,
+                "agent": new_agent,
+                "started_at": now.isoformat(),
+                "advanced_from": old_stage,
+            }],
+        )
+        db.add(state)
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to advance pipeline: {str(e)}")
+
+    # Sync to Supabase
+    try:
+        from tools.pipeline_sync import sync_activity
+        sync_activity(
+            project_id=str(project_uuid),
+            action_type="pipeline_advance",
+            description=f"Advanced from {old_stage} to {new_stage}",
+            agent_name=new_agent,
+        )
+    except Exception:
+        pass
+
+    return {
+        "project_id": str(project_uuid),
+        "old_stage": old_stage,
+        "new_stage": new_stage,
+        "new_agent": new_agent,
+        "advanced_at": now.isoformat(),
+    }
