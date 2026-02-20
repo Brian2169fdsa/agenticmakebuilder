@@ -112,3 +112,30 @@ def send_cost_alert(project_id: str, margin_pct: float) -> Optional[dict]:
         reference_type="cost",
         reference_id=project_id,
     )
+
+
+def send_build_fail_alert(
+    project_id: str, confidence_score: float, fix_count: int = 0
+) -> Optional[dict]:
+    """Send a build failure alert notification.
+
+    Args:
+        project_id: UUID string.
+        confidence_score: The failing confidence score.
+        fix_count: Number of fix instructions generated.
+
+    Returns:
+        Inserted notification dict, or None.
+    """
+    return send_notification(
+        department="customer_delivery",
+        type="alert",
+        title=f"Build failed: confidence {confidence_score:.1f}%",
+        message=(
+            f"Project {project_id} build verification failed with "
+            f"confidence {confidence_score:.1f}%. "
+            f"{fix_count} fix instruction(s) generated. Review required."
+        ),
+        reference_type="build",
+        reference_id=project_id,
+    )
