@@ -24,10 +24,18 @@ class Project(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(Text, nullable=False, unique=True)
+    customer_name = Column(Text, default="Unknown")
+    status = Column(Text, nullable=False, default="active")
     created_at = Column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    revenue = Column(Float, default=0.0)
 
     builds = relationship(
         "Build", back_populates="project", cascade="all, delete-orphan",
@@ -155,6 +163,48 @@ class ProjectFinancial(Base):
     output_tokens = Column(Integer, nullable=False)
     operation_type = Column(Text, nullable=False)
     cost_usd = Column(Float, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class PersonaClientContext(Base):
+    __tablename__ = "persona_client_context"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    persona = Column(Text, nullable=False)
+    client_id = Column(Text, nullable=False)
+    tone_preferences = Column(JSONB)
+    past_interactions_summary = Column(Text)
+    communication_style = Column(Text)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "persona", "client_id",
+            name="uq_persona_client_context_persona_client",
+        ),
+    )
+
+
+class PersonaFeedback(Base):
+    __tablename__ = "persona_feedback"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    persona = Column(Text, nullable=False)
+    client_id = Column(Text, nullable=False)
+    interaction_id = Column(Text, nullable=False)
+    rating = Column(Integer, nullable=False)
+    notes = Column(Text)
     created_at = Column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc),

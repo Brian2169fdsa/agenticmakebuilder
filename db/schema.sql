@@ -6,10 +6,15 @@
 CREATE TABLE IF NOT EXISTS projects (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
-    customer_name TEXT NOT NULL,
+    customer_name TEXT DEFAULT 'Unknown',
+    status TEXT NOT NULL DEFAULT 'active',
+    revenue FLOAT DEFAULT 0.0,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
+CREATE INDEX IF NOT EXISTS idx_projects_updated ON projects(updated_at);
 
 CREATE TABLE IF NOT EXISTS builds (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -185,3 +190,36 @@ CREATE TABLE IF NOT EXISTS project_financials (
 );
 
 CREATE INDEX IF NOT EXISTS idx_financials_project ON project_financials(project_id, created_at DESC);
+
+-- ── Persona client context (persona-builder service) ────────
+
+CREATE TABLE IF NOT EXISTS persona_client_context (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    persona TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    tone_preferences JSONB,
+    past_interactions_summary TEXT,
+    communication_style TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(persona, client_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_persona_ctx_persona ON persona_client_context(persona);
+CREATE INDEX IF NOT EXISTS idx_persona_ctx_client ON persona_client_context(client_id);
+
+-- ── Persona feedback ─────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS persona_feedback (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    persona TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    interaction_id TEXT NOT NULL,
+    rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    notes TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_persona_fb_persona ON persona_feedback(persona);
+CREATE INDEX IF NOT EXISTS idx_persona_fb_client ON persona_feedback(client_id);
+CREATE INDEX IF NOT EXISTS idx_persona_fb_interaction ON persona_feedback(interaction_id);

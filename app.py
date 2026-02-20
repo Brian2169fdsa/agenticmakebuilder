@@ -13,6 +13,11 @@ Endpoints:
   GET  /supervisor/stalled — detect stalled projects (>48h no update)
   POST /costs/track        — track per-operation token costs
   GET  /costs/summary      — cost/revenue/margin summary per client
+  POST /persona/memory     — link persona to client with tone/style prefs
+  GET  /persona/context    — get persona's full context for a client
+  POST /persona/feedback   — store interaction feedback for a persona
+  GET  /persona/performance — persona performance stats across all clients
+  POST /persona/deploy     — generate client-specific persona artifact
 
 HTTP status codes:
   200 — success
@@ -33,7 +38,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from db.session import get_db, check_db
-from db.models import AgentHandoff, ProjectFinancial, Project
+from db.models import AgentHandoff, ProjectFinancial, Project, PersonaClientContext, PersonaFeedback
 from tools.module_registry_loader import load_module_registry
 from tools.build_scenario_pipeline import build_scenario_pipeline
 from tools.generate_delivery_assessment import generate_delivery_assessment
@@ -843,6 +848,69 @@ def handoff(request: HandoffRequest, db: Session = Depends(get_db)):
     }
 
 
+# ─────────────────────────────────────────
+# GET /supervisor/stalled — Stalled project detection
+# ─────────────────────────────────────────
+
+@app.get("/supervisor/stalled")
+def supervisor_stalled(db: Session = Depends(get_db)):
+    """
+    Detect stalled projects — any project with updated_at older than 48 hours
+    and status not in ('deployed', 'cancelled').
+
+    Returns a list of stalled projects with project_id, client, hours_stalled,
+    and last_action (most recent build status).
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT
+                p.id AS project_id,
+                p.name AS project_name,
+                COALESCE(p.customer_name, 'Unknown') AS client,
+                p.status AS project_status,
+                p.updated_at,
+                EXTRACT(EPOCH FROM (now() - p.updated_at)) / 3600 AS hours_stalled,
+                (
+                    SELECT b.status
+                    FROM builds b
+                    WHERE b.project_id = p.id
+                    ORDER BY b.created_at DESC
+                    LIMIT 1
+                ) AS last_build_status,
+                (
+                    SELECT b.slug
+                    FROM builds b
+                    WHERE b.project_id = p.id
+                    ORDER BY b.created_at DESC
+                    LIMIT 1
+                ) AS last_slug
+            FROM projects p
+            WHERE p.updated_at < now() - interval '48 hours'
+              AND p.status NOT IN ('deployed', 'cancelled')
+            ORDER BY p.updated_at ASC
+        """)).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    stalled = []
+    for row in rows:
+        stalled.append({
+            "project_id": str(row.project_id),
+            "project_name": row.project_name,
+            "client": row.client,
+            "project_status": row.project_status,
+            "hours_stalled": round(row.hours_stalled, 1),
+            "last_action": row.last_build_status or "no builds",
+            "last_slug": row.last_slug,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        })
+
+    return {
+        "stalled_count": len(stalled),
+        "stalled_projects": stalled,
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
@@ -868,3 +936,94 @@ def _audit_recommendations(errors, warnings, confidence):
         recs.append(f"Consider reviewing {len(warnings)} warnings — they may indicate suboptimal configuration.")
 
     return recs
+
+
+# ─────────────────────────────────────────
+# Persona Service — valid personas
+# ─────────────────────────────────────────
+
+VALID_PERSONAS = {"rebecka", "daniel", "sarah", "andrew"}
+
+
+def _validate_persona(persona: str) -> str:
+    """Normalise and validate persona name. Raises 400 on invalid."""
+    p = persona.strip().lower()
+    if p not in VALID_PERSONAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid persona '{persona}'. Must be one of: {', '.join(sorted(VALID_PERSONAS))}",
+        )
+    return p
+
+
+# ─────────────────────────────────────────
+# POST /persona/memory
+# ─────────────────────────────────────────
+
+class PersonaMemoryRequest(BaseModel):
+    persona: str
+    client_id: str
+    tone_preferences: Optional[dict] = None
+    past_interactions_summary: Optional[str] = None
+    communication_style: Optional[str] = None
+
+
+@app.post("/persona/memory")
+def persona_memory(request: PersonaMemoryRequest, db: Session = Depends(get_db)):
+    """
+    Link a persona to a client. Stores client-specific tone preferences,
+    past interactions summary, and communication style.
+
+    Upserts — if the persona+client_id pair already exists, updates it.
+    """
+    persona = _validate_persona(request.persona)
+
+    if not request.client_id.strip():
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    existing = (
+        db.query(PersonaClientContext)
+        .filter(
+            PersonaClientContext.persona == persona,
+            PersonaClientContext.client_id == request.client_id.strip(),
+        )
+        .first()
+    )
+
+    now = datetime.now(timezone.utc)
+
+    if existing:
+        if request.tone_preferences is not None:
+            existing.tone_preferences = request.tone_preferences
+        if request.past_interactions_summary is not None:
+            existing.past_interactions_summary = request.past_interactions_summary
+        if request.communication_style is not None:
+            existing.communication_style = request.communication_style
+        existing.updated_at = now
+        db.commit()
+        db.refresh(existing)
+        record = existing
+    else:
+        record = PersonaClientContext(
+            persona=persona,
+            client_id=request.client_id.strip(),
+            tone_preferences=request.tone_preferences,
+            past_interactions_summary=request.past_interactions_summary,
+            communication_style=request.communication_style,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+
+    return {
+        "id": str(record.id),
+        "persona": record.persona,
+        "client_id": record.client_id,
+        "tone_preferences": record.tone_preferences,
+        "past_interactions_summary": record.past_interactions_summary,
+        "communication_style": record.communication_style,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+    }
