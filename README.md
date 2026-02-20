@@ -1,9 +1,9 @@
-# agenticmakebuilder v2.1.0
+# agenticmakebuilder v2.2.0
 
 ![Python 3.13](https://img.shields.io/badge/Python-3.13-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?logo=fastapi&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-59%20passing-brightgreen?logo=pytest&logoColor=white)
-![Endpoints](https://img.shields.io/badge/Endpoints-35-orange)
+![Tests](https://img.shields.io/badge/Tests-87%20passing-brightgreen?logo=pytest&logoColor=white)
+![Endpoints](https://img.shields.io/badge/Endpoints-51-orange)
 
 ## What It Does
 
@@ -45,14 +45,25 @@ curl http://localhost:8000/health
 | POST | `/build` | Compiler direct (requires plan_dict) | `plan`, `original_request` |
 | POST | `/audit` | Audit existing Make.com blueprint | `blueprint`, `scenario_name` |
 
-### Multi-Agent Orchestration (4 endpoints)
+### Multi-Agent Orchestration (6 endpoints)
 
 | Method | Endpoint | Description | Key Params |
 |--------|----------|-------------|------------|
 | POST | `/orchestrate` | Advance project through pipeline stages | `project_id`, `current_stage` |
 | POST | `/agent/complete` | Agent completion + auto-advance | `project_id`, `agent_name`, `outcome` |
 | GET | `/pipeline/status` | Full pipeline state view | `?project_id=` |
+| POST | `/pipeline/advance` | Advance project to next/specific stage | `project_id`, `force_stage` |
+| GET | `/pipeline/dashboard` | All projects grouped by pipeline stage | — |
 | POST | `/briefing` | Daily supervisor briefing report | — |
+
+### Intelligence Layer (4 endpoints)
+
+| Method | Endpoint | Description | Key Params |
+|--------|----------|-------------|------------|
+| POST | `/clients/health` | Client health assessment (healthy/at_risk/unhealthy) | — |
+| GET | `/clients/list` | Client directory with project stats | — |
+| POST | `/briefing/daily` | Comprehensive daily briefing with alerts + recommendations | — |
+| POST | `/handoff` | Multi-agent handoff bridge | `from_agent`, `to_agent`, `project_id` |
 
 ### Agent Memory & Learning (4 endpoints)
 
@@ -63,13 +74,15 @@ curl http://localhost:8000/health
 | POST | `/memory/embed` | Embed project brief for similarity search | `project_id`, `brief`, `outcome` |
 | GET | `/similar` | TF-IDF cosine similarity search | `?description=&top_n=` |
 
-### Confidence & Verification (3 endpoints)
+### Confidence & Verification (5 endpoints)
 
 | Method | Endpoint | Description | Key Params |
 |--------|----------|-------------|------------|
 | POST | `/verify` | 77-rule blueprint validation with fix instructions | `blueprint`, `project_id` (optional) |
 | POST | `/verify/loop` | Iterative verify-fix-verify cycle (max 5 iterations) | `project_id`, `blueprint`, `max_iterations` |
+| POST | `/verify/auto` | Auto-verify + pipeline advance if confidence >= 85 | `project_id`, `blueprint` |
 | GET | `/confidence/history` | Verification run history with score trends | `?project_id=` |
+| GET | `/confidence/trend` | Confidence score trend (improving/declining/stable) | `?project_id=` |
 
 ### Deployment Agent (3 endpoints)
 
@@ -88,7 +101,7 @@ curl http://localhost:8000/health
 | GET | `/costs/report` | Weekly cost report in markdown | `?client_id=&weeks=` |
 | POST | `/costs/estimate` | Pre-build cost estimation from historical data | `description`, `category` |
 
-### Persona Engine (5 endpoints)
+### Persona Engine (7 endpoints)
 
 | Method | Endpoint | Description | Key Params |
 |--------|----------|-------------|------------|
@@ -96,7 +109,19 @@ curl http://localhost:8000/health
 | GET | `/persona/context` | Persona's full context for a client | `?persona=&client_id=` |
 | POST | `/persona/feedback` | Store interaction feedback | `persona`, `client_id`, `rating` |
 | GET | `/persona/performance` | Persona performance stats | `?persona=` |
-| POST | `/persona/deploy` | Generate client-specific persona artifact | `persona`, `client_id` |
+| POST | `/persona/deploy` | Generate client-specific persona artifact (v2.0) | `persona`, `client_id` |
+| POST | `/persona/test` | Test persona via Claude API | `persona`, `message`, `client_id` |
+| GET | `/personas/list` | All personas with live stats | — |
+
+### Admin Control Plane (5 endpoints)
+
+| Method | Endpoint | Description | Key Params |
+|--------|----------|-------------|------------|
+| POST | `/admin/reset-project` | Reset project pipeline to target stage | `project_id`, `target_stage` |
+| POST | `/admin/bulk-verify` | Batch verify up to 10 projects | `project_ids`, `blueprint` |
+| GET | `/admin/system-status` | Full platform snapshot (DB, registry, costs, personas) | — |
+| POST | `/admin/reindex` | Re-embed all client context into TF-IDF store | — |
+| GET | `/admin/audit-log` | Agent handoff audit trail | `?limit=` |
 
 ### Platform Health (3 endpoints)
 
@@ -118,25 +143,10 @@ curl http://localhost:8000/health
 |--------|----------|-------------|------------|
 | POST | `/command` | Route free-text commands to endpoints | `command`, `customer_name` |
 
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DATABASE_URL` | Yes | PostgreSQL connection string |
-| `MAKE_API_KEY` | No | Make.com API token for deployment + monitoring |
-| `MAKE_TEAM_ID` | No | Make.com team ID |
-| `MAKE_API_BASE` | No | Make.com API base URL (default: `https://us1.make.com/api/v2`) |
-| `SLACK_WEBHOOK_URL` | No | Slack webhook for incident notifications |
-| `MANAGEAI_HOURLY_RATE` | No | Hourly rate for SOW estimates (default: `150`) |
-| `MONITOR_INTERVAL` | No | Execution poller interval in seconds (default: `900`) |
-| `MONITOR_LOOKBACK` | No | Number of recent executions to check (default: `20`) |
-| `SUPABASE_URL` | No | connect-hub Supabase project URL for real-time sync |
-| `SUPABASE_SERVICE_KEY` | No | Service role key for server-side writes to Supabase |
-
 ## Architecture
 
 ```
-                         agenticmakebuilder v2.0.0
+                         agenticmakebuilder v2.2.0
   ┌─────────────────────────────────────────────────────────────────┐
   │                                                                 │
   │   Client                                                        │
@@ -152,23 +162,32 @@ curl http://localhost:8000/health
   │   │    │          │          │          │         │              │
   │   │  Assessor  Builder  Validator  Deployer      │              │
   │   │                                              │              │
-  │   │  /orchestrate    /agent/complete             │              │
-  │   │  /pipeline/status  /briefing                 │              │
+  │   │  /orchestrate     /agent/complete            │              │
+  │   │  /pipeline/status /pipeline/advance          │              │
+  │   │  /pipeline/dashboard                         │              │
   │   └──────────────────────────────────────────────┘              │
-  │          │              │              │                         │
-  │          ▼              ▼              ▼                         │
-  │   ┌────────────┐ ┌───────────┐ ┌────────────┐                  │
-  │   │   MEMORY   │ │   COSTS   │ │   HEALTH   │                  │
-  │   │            │ │           │ │            │                  │
-  │   │ /memory    │ │ /costs/   │ │ /health/   │                  │
-  │   │ /similar   │ │  track    │ │  full      │                  │
-  │   │ /memory/   │ │  summary  │ │  memory    │                  │
-  │   │  embed     │ │  report   │ │  repair    │                  │
-  │   │            │ │  estimate │ │            │                  │
-  │   │ TF-IDF     │ │           │ │ Self-heal  │                  │
-  │   │ Vectors    │ │ Margin    │ │ Auto-fix   │                  │
-  │   └────────────┘ │ Alerts    │ └────────────┘                  │
+  │          │              │              │              │          │
+  │          ▼              ▼              ▼              ▼          │
+  │   ┌────────────┐ ┌───────────┐ ┌────────────┐ ┌──────────┐    │
+  │   │   MEMORY   │ │   COSTS   │ │   HEALTH   │ │  ADMIN   │    │
+  │   │            │ │           │ │            │ │          │    │
+  │   │ /memory    │ │ /costs/   │ │ /health/   │ │ /admin/  │    │
+  │   │ /similar   │ │  track    │ │  full      │ │  reset   │    │
+  │   │ /memory/   │ │  summary  │ │  memory    │ │  bulk-   │    │
+  │   │  embed     │ │  report   │ │  repair    │ │  verify  │    │
+  │   │            │ │  estimate │ │            │ │  system  │    │
+  │   │ TF-IDF     │ │           │ │ Self-heal  │ │  reindex │    │
+  │   │ Vectors    │ │ Margin    │ │ Auto-fix   │ │  audit   │    │
+  │   └────────────┘ │ Alerts    │ └────────────┘ └──────────┘    │
   │                  └───────────┘                                  │
+  │                       │                                         │
+  │   ┌──────────────────────────────────────────────┐              │
+  │   │   SUPABASE SYNC LAYER                        │              │
+  │   │                                              │              │
+  │   │  supabase_client.py  → REST API (httpx)      │              │
+  │   │  pipeline_sync.py    → State + Verification  │              │
+  │   │  notification_sender → Stall/Cost Alerts     │              │
+  │   └──────────────────────────────────────────────┘              │
   │                                                                 │
   │   ┌──────────────────────────────────────────────┐              │
   │   │   /command — Natural Language Router          │              │
@@ -180,6 +199,22 @@ curl http://localhost:8000/health
   │   PostgreSQL (Supabase/Railway)    embeddings.json (TF-IDF)     │
   └─────────────────────────────────────────────────────────────────┘
 ```
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `ANTHROPIC_API_KEY` | No | Anthropic API key for persona test endpoint |
+| `MAKE_API_KEY` | No | Make.com API token for deployment + monitoring |
+| `MAKE_TEAM_ID` | No | Make.com team ID |
+| `MAKE_API_BASE` | No | Make.com API base URL (default: `https://us1.make.com/api/v2`) |
+| `SLACK_WEBHOOK_URL` | No | Slack webhook for incident notifications |
+| `MANAGEAI_HOURLY_RATE` | No | Hourly rate for SOW estimates (default: `150`) |
+| `MONITOR_INTERVAL` | No | Execution poller interval in seconds (default: `900`) |
+| `MONITOR_LOOKBACK` | No | Number of recent executions to check (default: `20`) |
+| `SUPABASE_URL` | No | connect-hub Supabase project URL for real-time sync |
+| `SUPABASE_SERVICE_KEY` | No | Service role key for server-side writes to Supabase |
 
 ## Running Tests
 
@@ -193,7 +228,7 @@ pip install pytest httpx
 # Run full suite
 pytest tests/ -v
 
-# Expected: 59 passed
+# Expected: 87 passed
 ```
 
 Tests mock the database layer so no Postgres connection is needed to run them.
