@@ -3263,36 +3263,59 @@ class PersonaDeployRequest(BaseModel):
 @app.post("/persona/deploy")
 def persona_deploy(request: PersonaDeployRequest, db: Session = Depends(get_db)):
     """
-    Generate a client-specific persona artifact.
+    Generate a real, deployable client-specific persona artifact.
 
-    Merges the base persona definition with any stored client context
-    and the provided config_overrides. Returns a deployable persona
-    artifact with custom name, tone, knowledge base references, and
-    system prompt baked in.
+    Pulls tone_preferences, communication_style, and interaction_summary
+    from persona_client_context. Pulls feedback stats from persona_feedback.
+    Merges with base persona definition and any config_overrides.
+    Returns a complete JSON artifact ready for deployment.
     """
     persona = _validate_persona(request.persona)
 
     if not request.client_id.strip():
         raise HTTPException(status_code=400, detail="client_id is required")
 
+    client_id = request.client_id.strip()
     base = _PERSONA_DEFAULTS[persona]
     overrides = request.config_overrides or {}
+    deploy_ts = datetime.now(timezone.utc)
 
-    # Fetch stored client context if it exists
+    # ── Pull DB context ────────────────────────────────────────
     ctx = (
         db.query(PersonaClientContext)
         .filter(
             PersonaClientContext.persona == persona,
-            PersonaClientContext.client_id == request.client_id.strip(),
+            PersonaClientContext.client_id == client_id,
         )
         .first()
     )
 
-    # Build the merged artifact
+    # ── Pull feedback stats ────────────────────────────────────
+    fb_row = db.execute(
+        text(
+            "SELECT COUNT(*) AS total, COALESCE(AVG(rating), 0) AS avg_rating "
+            "FROM persona_feedback WHERE persona = :p AND client_id = :c"
+        ),
+        {"p": persona, "c": client_id},
+    ).first()
+
+    feedback_stats = {
+        "total_interactions": fb_row.total if fb_row else 0,
+        "avg_rating": round(float(fb_row.avg_rating), 2) if fb_row else 0.0,
+    }
+
+    # ── Merge values ───────────────────────────────────────────
     display_name = overrides.get("display_name", base["display_name"])
     role = overrides.get("role", base["role"])
-    tone = overrides.get("tone", ctx.tone_preferences if ctx and ctx.tone_preferences else base["base_tone"])
-    style = overrides.get("communication_style", ctx.communication_style if ctx and ctx.communication_style else base["base_style"])
+
+    # Tone: overrides > DB context > base default
+    db_tone = ctx.tone_preferences if ctx and ctx.tone_preferences else None
+    tone = overrides.get("tone", db_tone if db_tone else base["base_tone"])
+
+    # Style: overrides > DB context > base default
+    db_style = ctx.communication_style if ctx and ctx.communication_style else None
+    style = overrides.get("communication_style", db_style if db_style else base["base_style"])
+
     knowledge_bases = overrides.get("knowledge_bases", base["knowledge_bases"])
     extra_knowledge = overrides.get("extra_knowledge_bases", [])
     if extra_knowledge:
@@ -3300,10 +3323,16 @@ def persona_deploy(request: PersonaDeployRequest, db: Session = Depends(get_db))
 
     past_context = ctx.past_interactions_summary if ctx and ctx.past_interactions_summary else None
 
-    # Generate system prompt
+    # ── Build system prompt with full client context ───────────
+    tone_str = (
+        tone if isinstance(tone, str)
+        else ", ".join(f"{k}: {v}" for k, v in tone.items()) if isinstance(tone, dict)
+        else str(tone)
+    )
+
     system_prompt = (
         f"You are {display_name}, {role} at ManageAI.\n\n"
-        f"Tone: {tone if isinstance(tone, str) else ', '.join(f'{k}: {v}' for k, v in tone.items()) if isinstance(tone, dict) else str(tone)}\n"
+        f"Tone: {tone_str}\n"
         f"Communication style: {style}\n\n"
         f"Knowledge bases available: {', '.join(knowledge_bases)}\n"
     )
@@ -3311,23 +3340,37 @@ def persona_deploy(request: PersonaDeployRequest, db: Session = Depends(get_db))
     if past_context:
         system_prompt += f"\nClient context from past interactions:\n{past_context}\n"
 
+    if feedback_stats["total_interactions"] > 0:
+        system_prompt += (
+            f"\nClient feedback summary: {feedback_stats['total_interactions']} interactions, "
+            f"avg rating {feedback_stats['avg_rating']}/5.\n"
+        )
+
     system_prompt += (
-        f"\nYou are speaking with client '{request.client_id.strip()}'.\n"
+        f"\nYou are speaking with client '{client_id}'.\n"
         "Always stay in character. Be helpful, accurate, and professional."
     )
 
+    # ── Assemble complete artifact ─────────────────────────────
     artifact = {
+        "artifact_version": "2.0",
         "persona": persona,
-        "client_id": request.client_id.strip(),
+        "client_id": client_id,
         "display_name": display_name,
         "role": role,
-        "tone": tone,
+        "tone_preferences": tone,
         "communication_style": style,
         "knowledge_bases": knowledge_bases,
-        "past_interactions_summary": past_context,
+        "client_context": {
+            "has_stored_context": ctx is not None,
+            "past_interactions_summary": past_context,
+            "tone_source": "database" if db_tone else "override" if overrides.get("tone") else "default",
+            "style_source": "database" if db_style else "override" if overrides.get("communication_style") else "default",
+        },
+        "feedback_stats": feedback_stats,
         "system_prompt": system_prompt,
         "config_overrides_applied": overrides,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "deploy_timestamp": deploy_ts.isoformat(),
     }
 
     return artifact
