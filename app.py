@@ -3845,3 +3845,61 @@ def pipeline_advance(request: PipelineAdvanceRequest, db: Session = Depends(get_
         "new_agent": new_agent,
         "advanced_at": now.isoformat(),
     }
+
+
+# ── GET /pipeline/dashboard ─────────────────────────────────────
+
+
+@app.get("/pipeline/dashboard")
+def pipeline_dashboard(db: Session = Depends(get_db)):
+    """
+    Full pipeline dashboard: all projects grouped by stage.
+
+    Each project includes project_id, customer_name, current_agent,
+    started_at, and days_in_stage. Summary counts per stage at top level.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT
+                pas.project_id,
+                p.name AS project_name,
+                COALESCE(p.customer_name, 'Unknown') AS customer_name,
+                pas.current_stage,
+                pas.current_agent,
+                pas.started_at,
+                pas.updated_at,
+                pas.pipeline_health,
+                EXTRACT(EPOCH FROM (now() - pas.updated_at)) / 86400 AS days_in_stage
+            FROM project_agent_state pas
+            JOIN projects p ON p.id = pas.project_id
+            ORDER BY pas.updated_at ASC
+        """)).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    # Group by stage
+    stages = {s: [] for s in _STAGE_ORDER}
+    stages["completed"] = []
+    stages["failed"] = []
+
+    for row in rows:
+        stage = row.current_stage if row.current_stage in stages else "completed"
+        if row.pipeline_health == "failed":
+            stage = "failed"
+        elif row.pipeline_health == "completed":
+            stage = "completed"
+
+        stages[stage].append({
+            "project_id": str(row.project_id),
+            "project_name": row.project_name,
+            "customer_name": row.customer_name,
+            "current_agent": row.current_agent,
+            "pipeline_health": row.pipeline_health,
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "days_in_stage": round(float(row.days_in_stage), 1) if row.days_in_stage else 0,
+        })
+
+    summary = {s: len(projects) for s, projects in stages.items()}
+
+    return {"stages": stages, "summary": summary, "total_projects": len(rows)}
