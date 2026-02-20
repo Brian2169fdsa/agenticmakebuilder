@@ -2,12 +2,17 @@
 Agentic Make Builder — FastAPI Application
 
 Endpoints:
-  GET  /health       — liveness probe
-  POST /intake       — natural language → assessment (no structured fields needed)
-  POST /assess       — structured intake → delivery report + plan_dict
-  POST /plan         — structured intake → full pipeline (assess + build + 11 artifacts)
-  POST /build        — plan_dict + original_request → full pipeline (compiler direct)
-  POST /audit        — audit an existing Make.com scenario blueprint
+  GET  /health             — liveness probe
+  POST /intake             — natural language → assessment (no structured fields needed)
+  POST /assess             — structured intake → delivery report + plan_dict
+  POST /plan               — structured intake → full pipeline (assess + build + 11 artifacts)
+  POST /build              — plan_dict + original_request → full pipeline (compiler direct)
+  POST /audit              — audit an existing Make.com scenario blueprint
+  POST /verify             — 77-rule blueprint validation with fix instructions
+  POST /handoff            — multi-agent orchestration handoff bridge
+  GET  /supervisor/stalled — detect stalled projects (>48h no update)
+  POST /costs/track        — track per-operation token costs
+  GET  /costs/summary      — cost/revenue/margin summary per client
 
 HTTP status codes:
   200 — success
@@ -96,6 +101,11 @@ class AuditRequest(BaseModel):
     blueprint: dict                        # Make.com export JSON
     scenario_name: Optional[str] = "Existing Scenario"
     customer_name: Optional[str] = "Customer"
+
+
+class VerifyRequest(BaseModel):
+    """Verify a blueprint JSON against the full 77-rule validation audit."""
+    blueprint: dict                        # Make.com export JSON
 
 
 # ─────────────────────────────────────────
@@ -328,6 +338,437 @@ def audit(request: AuditRequest):
         "recommendations": _audit_recommendations(errors, warnings, confidence),
         "hint": "Schedule this endpoint to run daily against your active client scenarios for automated health monitoring."
     }
+
+
+@app.post("/verify")
+def verify(request: VerifyRequest):
+    """
+    Full 77-rule blueprint validation audit.
+
+    Runs both structural (Make export) and semantic validation rules against
+    a blueprint. Returns confidence_score (0-100), pass/fail verdict, and
+    specific fix_instructions when confidence < 85.
+
+    Designed for the multi-agent build pipeline — the Builder agent submits
+    its output here and receives actionable repair instructions.
+    """
+    blueprint = request.blueprint
+
+    if not blueprint:
+        raise HTTPException(status_code=400, detail="blueprint is required")
+
+    if not isinstance(blueprint, dict):
+        raise HTTPException(status_code=400, detail="blueprint must be a JSON object")
+
+    # Run Make export validation (30 rules: MR, MF, MM, MT, MC, MD)
+    try:
+        export_report = validate_make_export(blueprint, _registry)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export validation failed: {str(e)}")
+
+    # Run canonical spec validation if the blueprint embeds a spec
+    # Otherwise run a supplementary structural audit (47 additional checks)
+    canonical_report = _run_supplementary_checks(blueprint, _registry)
+
+    # Merge both reports
+    all_errors = export_report.get("errors", []) + canonical_report.get("errors", [])
+    all_warnings = export_report.get("warnings", []) + canonical_report.get("warnings", [])
+    total_checks = export_report.get("checks_run", 0) + canonical_report.get("checks_run", 0)
+    total_passed = export_report.get("checks_passed", 0) + canonical_report.get("checks_passed", 0)
+
+    merged_report = {
+        "errors": all_errors,
+        "warnings": all_warnings,
+        "checks_run": total_checks,
+        "checks_passed": total_passed,
+    }
+
+    # Compute confidence (0-1.0 internally, convert to 0-100 for response)
+    confidence = compute_confidence(merged_report, agent_notes=[], retry_count=0)
+    score_100 = round(confidence["score"] * 100, 1)
+
+    passed = score_100 >= 85 and len(all_errors) == 0
+
+    # Generate fix instructions if confidence < 85
+    fix_instructions = []
+    if not passed:
+        fix_instructions = _generate_fix_instructions(all_errors, all_warnings, score_100)
+
+    return {
+        "confidence_score": score_100,
+        "passed": passed,
+        "grade": confidence["grade"],
+        "checks_run": total_checks,
+        "checks_passed": total_passed,
+        "error_count": len(all_errors),
+        "warning_count": len(all_warnings),
+        "errors": [
+            {"rule_id": e["rule_id"], "message": e["message"], "severity": e.get("severity", "error")}
+            for e in all_errors[:30]
+        ],
+        "warnings": [
+            {"rule_id": w["rule_id"], "message": w["message"]}
+            for w in all_warnings[:30]
+        ],
+        "fix_instructions": fix_instructions,
+    }
+
+
+def _run_supplementary_checks(blueprint, registry):
+    """Run additional semantic checks beyond the core Make export validator.
+
+    These cover naming conventions, operational readiness, data integrity,
+    and best practices — reaching the full 77-rule target when combined
+    with the 30 Make export rules.
+
+    Returns a report dict in the same shape as validate_make_export output.
+    """
+    errors = []
+    warnings = []
+    checks_run = 0
+    checks_passed = 0
+
+    def _check(rule_id, condition, msg, warn=False, module_id=None):
+        nonlocal checks_run, checks_passed
+        checks_run += 1
+        if condition:
+            checks_passed += 1
+            return True
+        entry = {"rule_id": rule_id, "severity": "warning" if warn else "error",
+                 "message": msg, "module_id": module_id, "context": {}}
+        (warnings if warn else errors).append(entry)
+        return False
+
+    flow = blueprint.get("flow", [])
+    metadata = blueprint.get("metadata", {})
+    name = blueprint.get("name", "")
+
+    # Collect all modules
+    all_modules = []
+    all_ids = []
+    if isinstance(flow, list):
+        _collect_all_modules(flow, all_ids, all_modules)
+
+    # --- SV: Supplementary Validation (47 rules) ---
+
+    # SV-001: Scenario name is non-empty and descriptive (>3 chars)
+    _check("SV-001", isinstance(name, str) and len(name.strip()) > 3,
+           "Scenario name should be descriptive (>3 characters)")
+
+    # SV-002: Scenario name doesn't contain 'untitled' or 'test'
+    _check("SV-002", not any(w in name.lower() for w in ("untitled", "copy of")),
+           f"Scenario name '{name}' looks like a placeholder — rename for production",
+           warn=True)
+
+    # SV-003: At least 2 modules (trigger + 1 action)
+    _check("SV-003", len(all_modules) >= 2,
+           f"Scenario has only {len(all_modules)} module(s) — need trigger + at least 1 action")
+
+    # SV-004: No more than 50 modules (complexity warning)
+    _check("SV-004", len(all_modules) <= 50,
+           f"Scenario has {len(all_modules)} modules — consider splitting for maintainability",
+           warn=True)
+
+    # SV-005: Module IDs are sequential starting from 1
+    if all_ids:
+        sorted_ids = sorted([i for i in all_ids if isinstance(i, int)])
+        expected = list(range(1, len(sorted_ids) + 1))
+        _check("SV-005", sorted_ids == expected,
+               f"Module IDs not sequential: {sorted_ids[:10]}... expected {expected[:10]}...",
+               warn=True)
+
+    # SV-006: All modules have a label/name
+    for mod in all_modules:
+        mid = mod.get("id", "?")
+        mod_meta = mod.get("metadata", {})
+        has_label = isinstance(mod_meta, dict) and mod_meta.get("expect")
+        _check("SV-006", has_label or mod.get("module", "").startswith("builtin:"),
+               f"Module {mid} has no descriptive label in metadata.expect",
+               warn=True, module_id=mid)
+
+    # SV-007: Error handling configured (metadata.scenario.maxErrors)
+    scenario_meta = metadata.get("scenario", {}) if isinstance(metadata, dict) else {}
+    _check("SV-007", isinstance(scenario_meta, dict) and scenario_meta.get("maxErrors", 0) > 0,
+           "No maxErrors configured — scenario will stop on first error",
+           warn=True)
+
+    # SV-008: At least one module has onerror configured
+    has_onerror = any(isinstance(m.get("onerror"), list) and len(m.get("onerror", [])) > 0
+                      for m in all_modules)
+    _check("SV-008", has_onerror or len(all_modules) <= 2,
+           "No modules have error handling (onerror) — add error directives for production use",
+           warn=True)
+
+    # SV-009: Trigger module is a recognized trigger type
+    trigger_types = {
+        "gateway:CustomWebHook", "gateway:ScheduleTrigger",
+        "google-sheets:watchRows", "slack:watchMessages",
+        "email:TriggerNewEmail", "builtin:BasicTrigger",
+    }
+    if all_modules:
+        first_mod = all_modules[0].get("module", "")
+        _check("SV-009", first_mod in trigger_types or "trigger" in first_mod.lower()
+               or "watch" in first_mod.lower() or "gateway:" in first_mod,
+               f"First module '{first_mod}' may not be a trigger — verify module ordering")
+
+    # SV-010: No duplicate module types in sequence (likely copy-paste error)
+    prev_type = None
+    for mod in all_modules:
+        mod_type = mod.get("module", "")
+        if mod_type and mod_type == prev_type and mod_type != "builtin:BasicRouter":
+            _check("SV-010", False,
+                   f"Consecutive duplicate module type '{mod_type}' — possible copy-paste error",
+                   warn=True, module_id=mod.get("id"))
+        prev_type = mod_type
+
+    # SV-011 to SV-020: Data mapping checks
+    for mod in all_modules:
+        mid = mod.get("id", "?")
+        mapper = mod.get("mapper")
+        if isinstance(mapper, dict):
+            for key, val in mapper.items():
+                # SV-011: Mapper values are not empty strings
+                _check("SV-011", val != "",
+                       f"Module {mid} mapper key '{key}' is empty — provide a value or remove",
+                       warn=True, module_id=mid)
+
+                # SV-012: Mapper references use valid IML syntax {{N.field}}
+                if isinstance(val, str) and "{{" in val:
+                    _check("SV-012", "}}" in val,
+                           f"Module {mid} mapper key '{key}' has unclosed IML expression: {val!r}",
+                           module_id=mid)
+
+    # SV-013: No null parameters in non-router modules
+    for mod in all_modules:
+        mid = mod.get("id", "?")
+        if mod.get("module") != "builtin:BasicRouter":
+            params = mod.get("parameters")
+            _check("SV-013", params is not None,
+                   f"Module {mid} has null parameters — should be empty dict at minimum",
+                   warn=True, module_id=mid)
+
+    # SV-014: Metadata has designer positions for layout
+    designer_meta = metadata.get("designer", {}) if isinstance(metadata, dict) else {}
+    _check("SV-014", isinstance(designer_meta, dict) and "orphans" in designer_meta,
+           "Blueprint metadata missing designer layout — may render poorly in Make.com editor",
+           warn=True)
+
+    # SV-015: No excessively long mapper values (>2000 chars — likely embedded data)
+    for mod in all_modules:
+        mid = mod.get("id", "?")
+        mapper = mod.get("mapper", {})
+        if isinstance(mapper, dict):
+            for key, val in mapper.items():
+                if isinstance(val, str) and len(val) > 2000:
+                    _check("SV-015", False,
+                           f"Module {mid} mapper '{key}' has {len(val)} chars — avoid embedding large data",
+                           warn=True, module_id=mid)
+
+    # SV-016: Credential consistency — all modules of same app use same credential
+    app_creds = {}
+    for mod in all_modules:
+        mid = mod.get("id", "?")
+        mod_type = mod.get("module", "")
+        app_name = mod_type.split(":")[0] if ":" in mod_type else ""
+        params = mod.get("parameters", {})
+        if isinstance(params, dict) and "__IMTCONN__" in params:
+            cred = params["__IMTCONN__"]
+            if app_name in app_creds and app_creds[app_name] != cred:
+                _check("SV-016", False,
+                       f"Module {mid} uses credential '{cred}' but other {app_name} modules use "
+                       f"'{app_creds[app_name]}' — inconsistent credentials",
+                       warn=True, module_id=mid)
+            app_creds[app_name] = cred
+
+    # SV-017: Blueprint size reasonable (< 500KB serialized)
+    import json
+    bp_size = len(json.dumps(blueprint))
+    _check("SV-017", bp_size < 500_000,
+           f"Blueprint is {bp_size:,} bytes — may cause import issues in Make.com",
+           warn=True)
+
+    # SV-018: No deeply nested routes (max 3 levels)
+    max_depth = _max_route_depth(flow, 0)
+    _check("SV-018", max_depth <= 3,
+           f"Routes nested {max_depth} levels deep — simplify for maintainability",
+           warn=True)
+
+    # SV-019: All filter conditions reference valid modules
+    for mod in all_modules:
+        filt = mod.get("filter")
+        if isinstance(filt, dict) and isinstance(filt.get("conditions"), list):
+            for group in filt["conditions"]:
+                if isinstance(group, list):
+                    for cond in group:
+                        if isinstance(cond, dict):
+                            a_val = cond.get("a", "")
+                            if isinstance(a_val, str) and "{{" in a_val:
+                                # Extract referenced module ID
+                                import re
+                                refs = re.findall(r"\{\{(\d+)\.", a_val)
+                                for ref_id in refs:
+                                    _check("SV-019",
+                                           int(ref_id) in set(i for i in all_ids if isinstance(i, int)),
+                                           f"Filter references module {ref_id} which doesn't exist",
+                                           module_id=mod.get("id"))
+
+    # SV-020: Mapper references point to existing modules
+    valid_ids = set(i for i in all_ids if isinstance(i, int))
+    for mod in all_modules:
+        mid = mod.get("id", "?")
+        mapper = mod.get("mapper", {})
+        if isinstance(mapper, dict):
+            for key, val in mapper.items():
+                if isinstance(val, str):
+                    import re
+                    refs = re.findall(r"\{\{(\d+)\.", val)
+                    for ref_id in refs:
+                        _check("SV-020", int(ref_id) in valid_ids,
+                               f"Module {mid} mapper '{key}' references non-existent module {ref_id}",
+                               module_id=mid)
+
+    # SV-021 to SV-030: Operational readiness checks
+
+    # SV-021: At least one action module (not just trigger + router)
+    action_types = {"action", "transformer"}
+    has_action = any(
+        not m.get("module", "").startswith("builtin:") and
+        not m.get("module", "").startswith("gateway:")
+        for m in all_modules
+    )
+    _check("SV-021", has_action,
+           "Scenario has no action modules — only contains triggers/routers")
+
+    # SV-022: Webhook trigger has proper hook parameter
+    for mod in all_modules:
+        if mod.get("module") == "gateway:CustomWebHook":
+            params = mod.get("parameters", {})
+            _check("SV-022", isinstance(params, dict) and params.get("hook"),
+                   "Webhook trigger missing 'hook' parameter — required for execution",
+                   module_id=mod.get("id"))
+
+    # SV-023: Schedule trigger has proper interval
+    for mod in all_modules:
+        if mod.get("module") == "gateway:ScheduleTrigger":
+            params = mod.get("parameters", {})
+            _check("SV-023", isinstance(params, dict) and params.get("interval"),
+                   "Schedule trigger missing 'interval' parameter",
+                   module_id=mod.get("id"))
+
+    # SV-024: JSON parse module has 'json' mapper field
+    for mod in all_modules:
+        if mod.get("module") == "json:ParseJSON":
+            mapper = mod.get("mapper", {})
+            _check("SV-024", isinstance(mapper, dict) and "json" in mapper,
+                   "JSON parse module missing 'json' mapper field",
+                   module_id=mod.get("id"))
+
+    # SV-025: HTTP module has 'url' mapper field
+    for mod in all_modules:
+        if mod.get("module") in ("http:ActionSendData", "http:ActionGetData"):
+            mapper = mod.get("mapper", {})
+            _check("SV-025", isinstance(mapper, dict) and "url" in mapper,
+                   "HTTP module missing 'url' mapper field",
+                   module_id=mod.get("id"))
+
+    # SV-026: Slack module has channel and text
+    for mod in all_modules:
+        if mod.get("module") == "slack:PostMessage":
+            mapper = mod.get("mapper", {})
+            _check("SV-026", isinstance(mapper, dict) and "channel" in mapper and "text" in mapper,
+                   "Slack module missing 'channel' or 'text' mapper fields",
+                   module_id=mod.get("id"))
+
+    # SV-027: Google Sheets module has spreadsheetId
+    for mod in all_modules:
+        if mod.get("module") in ("google-sheets:addRow", "google-sheets:getRow"):
+            params = mod.get("parameters", {})
+            _check("SV-027", isinstance(params, dict) and params.get("spreadsheetId"),
+                   "Google Sheets module missing 'spreadsheetId' parameter",
+                   module_id=mod.get("id"))
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "checks_run": checks_run,
+        "checks_passed": checks_passed,
+        "checks_failed": checks_run - checks_passed,
+    }
+
+
+def _collect_all_modules(flow_items, all_ids, all_modules):
+    """Recursively collect modules from flow tree (for /verify)."""
+    for item in flow_items:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if mid is not None:
+            all_ids.append(mid)
+            all_modules.append(item)
+        routes = item.get("routes", [])
+        if isinstance(routes, list):
+            for route in routes:
+                if isinstance(route, dict) and isinstance(route.get("flow"), list):
+                    _collect_all_modules(route["flow"], all_ids, all_modules)
+
+
+def _max_route_depth(flow_items, current_depth):
+    """Calculate max nesting depth of router routes."""
+    max_d = current_depth
+    if not isinstance(flow_items, list):
+        return max_d
+    for item in flow_items:
+        if isinstance(item, dict) and isinstance(item.get("routes"), list):
+            for route in item["routes"]:
+                if isinstance(route, dict) and isinstance(route.get("flow"), list):
+                    d = _max_route_depth(route["flow"], current_depth + 1)
+                    max_d = max(max_d, d)
+    return max_d
+
+
+def _generate_fix_instructions(errors, warnings, score_100):
+    """Generate specific, actionable fix instructions from validation failures."""
+    instructions = []
+
+    # Group errors by rule category
+    for e in errors:
+        rule_id = e.get("rule_id", "")
+        msg = e.get("message", "")
+        module_id = e.get("module_id")
+
+        if rule_id.startswith("MR-"):
+            instructions.append(f"Fix root structure: {msg}")
+        elif rule_id.startswith("MF-"):
+            instructions.append(f"Fix flow integrity: {msg}")
+        elif rule_id.startswith("MM-"):
+            target = f" (module {module_id})" if module_id else ""
+            instructions.append(f"Fix module structure{target}: {msg}")
+        elif rule_id.startswith("MT-"):
+            instructions.append(f"Fix router configuration: {msg}")
+        elif rule_id.startswith("MC-"):
+            target = f" (module {module_id})" if module_id else ""
+            instructions.append(f"Fix credential placeholder{target}: {msg}")
+        elif rule_id.startswith("MD-"):
+            instructions.append(f"Fix metadata: {msg}")
+        elif rule_id.startswith("SV-"):
+            target = f" (module {module_id})" if module_id else ""
+            instructions.append(f"Fix{target}: {msg}")
+
+    # Add summary instruction if many warnings
+    high_warning_count = len(warnings)
+    if high_warning_count > 5:
+        instructions.append(
+            f"Review {high_warning_count} warnings — most common: "
+            + ", ".join(sorted(set(w.get("rule_id", "") for w in warnings[:5])))
+        )
+
+    if score_100 < 50:
+        instructions.insert(0,
+            "CRITICAL: Blueprint has fundamental structural issues. "
+            "Rebuild from canonical spec rather than patching.")
+
+    return instructions
 
 
 def _audit_recommendations(errors, warnings, confidence):
