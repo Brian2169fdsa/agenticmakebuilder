@@ -1240,6 +1240,103 @@ def orchestrate(request: OrchestrateRequest, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/agent/complete")
+def agent_complete(request: AgentCompleteRequest, db: Session = Depends(get_db)):
+    """
+    Called when an agent finishes its work. Logs the handoff to agent_handoffs,
+    updates pipeline state, and auto-triggers orchestrate to advance to next stage.
+    """
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    state = db.query(ProjectAgentState).filter(
+        ProjectAgentState.project_id == project_uuid
+    ).first()
+
+    now = datetime.now(timezone.utc)
+
+    # Log handoff
+    current_stage = state.current_stage if state else "intake"
+    stage_idx = _STAGE_ORDER.index(current_stage) if current_stage in _STAGE_ORDER else 0
+    next_stage = _STAGE_ORDER[stage_idx + 1] if stage_idx < len(_STAGE_ORDER) - 1 else None
+    next_agent = _STAGE_AGENT_MAP.get(next_stage) if next_stage else None
+
+    handoff = AgentHandoff(
+        from_agent=request.agent_name,
+        to_agent=next_agent or "supervisor",
+        project_id=project_uuid,
+        context_bundle={
+            "outcome": request.outcome,
+            "artifacts": request.artifacts,
+            "completed_stage": current_stage,
+            "completed_at": now.isoformat(),
+        },
+    )
+    db.add(handoff)
+
+    # Update pipeline state
+    completion_entry = {
+        "stage": current_stage,
+        "agent": request.agent_name,
+        "outcome": request.outcome,
+        "completed_at": now.isoformat(),
+    }
+
+    if request.outcome == "failed":
+        if state:
+            state.pipeline_health = "failed"
+            state.updated_at = now
+            history = state.stage_history or []
+            history.append(completion_entry)
+            state.stage_history = history
+        db.commit()
+        return {
+            "project_id": str(project_uuid),
+            "status": "pipeline_failed",
+            "failed_stage": current_stage,
+            "failed_agent": request.agent_name,
+            "next_agent": None,
+        }
+
+    # Advance pipeline
+    if state and next_stage:
+        state.current_stage = next_stage
+        state.current_agent = next_agent
+        state.updated_at = now
+        state.pipeline_health = "on_track"
+        history = state.stage_history or []
+        history.append(completion_entry)
+        state.stage_history = history
+    elif state:
+        state.pipeline_health = "completed"
+        state.updated_at = now
+        history = state.stage_history or []
+        history.append(completion_entry)
+        state.stage_history = history
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "project_id": str(project_uuid),
+        "status": "advanced" if next_stage else "pipeline_complete",
+        "completed_stage": current_stage,
+        "completed_agent": request.agent_name,
+        "next_stage": next_stage,
+        "next_agent": next_agent,
+        "pipeline_health": state.pipeline_health if state else "on_track",
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
