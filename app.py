@@ -207,11 +207,63 @@ def assess(request: AssessRequest):
 def plan(request: AssessRequest, db: Session = Depends(get_db)):
     """
     Full pipeline: assess → build → 11 artifacts.
+    Now enriched with similar past projects and client memory context.
     Returns 422 if assessment is incomplete or confidence is too low.
     Returns 500 on pipeline exception.
     """
+    from tools.embedding_engine import find_similar
+
     intake = request.model_dump()
     project_name = intake.pop("project_name", "default") or "default"
+
+    # --- Enrich with similar past projects (Item 9) ---
+    similar_context = []
+    try:
+        original_req = intake.get("original_request", "")
+        if original_req:
+            similar_results = find_similar(original_req, top_n=3)
+            for s in similar_results:
+                similar_context.append({
+                    "project_id": s["id"],
+                    "score": s["score"],
+                    "summary": s["text_preview"],
+                    "metadata": s.get("metadata", {}),
+                })
+    except Exception:
+        pass  # Non-critical — proceed without similar context
+
+    # --- Enrich with client memory (Item 10) ---
+    client_memory = None
+    customer = intake.get("customer_name", "")
+    if customer and customer != "Customer":
+        try:
+            rows = db.query(ClientContext).filter(
+                ClientContext.client_id == customer
+            ).all()
+            if rows:
+                all_decisions = []
+                all_tech = set()
+                all_failures = []
+                for r in rows:
+                    if r.key_decisions:
+                        all_decisions.extend(r.key_decisions)
+                    if r.tech_stack:
+                        all_tech.update(r.tech_stack)
+                    if r.failure_patterns:
+                        all_failures.extend(r.failure_patterns)
+                client_memory = {
+                    "key_decisions": all_decisions,
+                    "tech_stack": sorted(all_tech),
+                    "failure_patterns": all_failures,
+                }
+        except Exception:
+            pass  # Non-critical
+
+    # Inject context into intake for the assessor
+    if similar_context:
+        intake["_similar_projects"] = similar_context
+    if client_memory:
+        intake["_client_memory"] = client_memory
 
     try:
         assessment = generate_delivery_assessment(intake, _registry)
@@ -254,12 +306,17 @@ def plan(request: AssessRequest, db: Session = Depends(get_db)):
             }
         )
 
-    return {
+    response = {
         "ready_for_build": True,
         "success": True,
         "delivery_report": assessment.get("delivery_report"),
         "build_result": build_result,
     }
+    if similar_context:
+        response["similar_projects"] = similar_context
+    if client_memory:
+        response["client_memory_used"] = True
+    return response
 
 
 @app.post("/build")
