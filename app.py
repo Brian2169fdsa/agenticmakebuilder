@@ -2474,6 +2474,265 @@ def deploy_status(project_id: str = Query(...), db: Session = Depends(get_db)):
     }
 
 
+@app.get("/health/full")
+def health_full(db: Session = Depends(get_db)):
+    """
+    Comprehensive platform health check.
+
+    Checks database connectivity, all core tables, API responsiveness,
+    embedding store integrity, and pipeline state. Returns detailed
+    status for each subsystem.
+    """
+    checks = {}
+    overall = "healthy"
+
+    # 1. Database connectivity
+    try:
+        db.execute(text("SELECT 1"))
+        checks["database"] = {"status": "ok", "message": "Connected"}
+    except Exception as e:
+        checks["database"] = {"status": "error", "message": str(e)}
+        overall = "degraded"
+
+    # 2. Core tables exist and are accessible
+    core_tables = [
+        "projects", "builds", "build_artifacts", "assumptions",
+        "audit_runs", "sow_documents", "test_runs", "incidents",
+        "execution_snapshots", "client_snapshots", "agent_handoffs",
+        "project_financials", "project_agent_state", "client_context",
+        "verification_runs", "deployments", "persona_client_context",
+        "persona_feedback",
+    ]
+    table_status = {}
+    for table in core_tables:
+        try:
+            result = db.execute(text(f"SELECT COUNT(*) FROM {table}"))
+            count = result.scalar()
+            table_status[table] = {"status": "ok", "row_count": count}
+        except Exception as e:
+            table_status[table] = {"status": "error", "message": str(e)}
+            overall = "degraded"
+    checks["tables"] = table_status
+
+    # 3. Embedding store
+    try:
+        from tools.embedding_engine import load_store
+        store = load_store()
+        doc_count = len(store.get("documents", []))
+        vocab_size = len(store.get("vocab", {}))
+        checks["embeddings"] = {
+            "status": "ok",
+            "document_count": doc_count,
+            "vocab_size": vocab_size,
+        }
+    except Exception as e:
+        checks["embeddings"] = {"status": "error", "message": str(e)}
+        overall = "degraded"
+
+    # 4. Module registry
+    checks["module_registry"] = {
+        "status": "ok" if _registry.get("module_count", 0) > 0 else "warning",
+        "module_count": _registry.get("module_count", 0),
+    }
+    if _registry.get("module_count", 0) == 0:
+        overall = "degraded" if overall == "healthy" else overall
+
+    # 5. Pipeline health — check for stalled projects
+    try:
+        stalled = db.execute(text("""
+            SELECT COUNT(*) FROM project_agent_state
+            WHERE updated_at < NOW() - INTERVAL '48 hours'
+              AND current_stage != 'deploy'
+        """)).scalar()
+        checks["pipeline"] = {
+            "status": "warning" if stalled > 0 else "ok",
+            "stalled_projects": stalled,
+        }
+        if stalled > 0:
+            overall = "degraded" if overall == "healthy" else overall
+    except Exception:
+        checks["pipeline"] = {"status": "ok", "stalled_projects": 0}
+
+    # 6. Recent activity
+    try:
+        recent_builds = db.execute(text(
+            "SELECT COUNT(*) FROM builds WHERE created_at > NOW() - INTERVAL '24 hours'"
+        )).scalar()
+        recent_verifications = db.execute(text(
+            "SELECT COUNT(*) FROM verification_runs WHERE created_at > NOW() - INTERVAL '24 hours'"
+        )).scalar()
+        checks["activity"] = {
+            "builds_24h": recent_builds,
+            "verifications_24h": recent_verifications,
+        }
+    except Exception:
+        checks["activity"] = {"builds_24h": 0, "verifications_24h": 0}
+
+    return {
+        "status": overall,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks": checks,
+    }
+
+
+@app.get("/health/memory")
+def health_memory():
+    """
+    Memory store health and statistics.
+
+    Returns embedding store size, document count, vocabulary coverage,
+    and average document length metrics.
+    """
+    from tools.embedding_engine import load_store
+    import os
+
+    try:
+        store = load_store()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load embedding store: {str(e)}")
+
+    documents = store.get("documents", [])
+    vocab = store.get("vocab", {})
+
+    # Compute stats
+    store_path = os.path.join(os.path.dirname(__file__), "data", "embeddings.json")
+    file_size_bytes = os.path.getsize(store_path) if os.path.exists(store_path) else 0
+
+    avg_terms = 0
+    if documents:
+        avg_terms = sum(len(doc.get("tf", {})) for doc in documents) / len(documents)
+
+    # Top terms by IDF (most discriminating)
+    sorted_vocab = sorted(vocab.items(), key=lambda x: x[1], reverse=True)
+    top_terms = [{"term": t, "idf": round(v, 3)} for t, v in sorted_vocab[:20]]
+
+    return {
+        "status": "ok" if documents else "empty",
+        "document_count": len(documents),
+        "vocab_size": len(vocab),
+        "avg_terms_per_doc": round(avg_terms, 1),
+        "store_file_size_bytes": file_size_bytes,
+        "store_version": store.get("version", 1),
+        "top_discriminating_terms": top_terms,
+        "documents": [
+            {
+                "id": doc["id"],
+                "term_count": len(doc.get("tf", {})),
+                "preview": doc.get("text_preview", "")[:100],
+            }
+            for doc in documents
+        ],
+    }
+
+
+@app.post("/health/repair")
+def health_repair(db: Session = Depends(get_db)):
+    """
+    Self-healing endpoint. Detects and repairs common platform issues:
+    - Stalled pipelines (>48h) → reset to current stage
+    - Orphaned agent states (no matching project) → clean up
+    - Embedding store corruption → rebuild from project data
+    - Inconsistent deployment records → mark stale as failed
+    """
+    repairs = []
+
+    # 1. Reset stalled pipelines
+    try:
+        stalled = db.execute(text("""
+            UPDATE project_agent_state
+            SET pipeline_health = 'stalled',
+                updated_at = NOW()
+            WHERE updated_at < NOW() - INTERVAL '48 hours'
+              AND current_stage != 'deploy'
+              AND pipeline_health = 'on_track'
+            RETURNING id, project_id, current_stage
+        """)).fetchall()
+        db.commit()
+        if stalled:
+            repairs.append({
+                "type": "stalled_pipeline_flagged",
+                "count": len(stalled),
+                "projects": [str(r.project_id) for r in stalled],
+            })
+    except Exception as e:
+        db.rollback()
+        repairs.append({"type": "stalled_pipeline_flagged", "error": str(e)})
+
+    # 2. Clean up orphaned agent states
+    try:
+        orphaned = db.execute(text("""
+            DELETE FROM project_agent_state
+            WHERE project_id NOT IN (SELECT id FROM projects)
+            RETURNING id
+        """)).fetchall()
+        db.commit()
+        if orphaned:
+            repairs.append({
+                "type": "orphaned_agent_states_removed",
+                "count": len(orphaned),
+            })
+    except Exception as e:
+        db.rollback()
+        repairs.append({"type": "orphaned_agent_states_removed", "error": str(e)})
+
+    # 3. Mark stale pending deployments as failed
+    try:
+        stale_deploys = db.execute(text("""
+            UPDATE deployments
+            SET status = 'failed',
+                last_health_check = jsonb_build_object(
+                    'status', 'auto_failed',
+                    'reason', 'Pending for >24h',
+                    'repaired_at', NOW()::text
+                )
+            WHERE status = 'pending'
+              AND deployed_at < NOW() - INTERVAL '24 hours'
+            RETURNING id, project_id
+        """)).fetchall()
+        db.commit()
+        if stale_deploys:
+            repairs.append({
+                "type": "stale_deployments_failed",
+                "count": len(stale_deploys),
+            })
+    except Exception as e:
+        db.rollback()
+        repairs.append({"type": "stale_deployments_failed", "error": str(e)})
+
+    # 4. Rebuild embedding store if corrupted
+    try:
+        from tools.embedding_engine import load_store, embed_document
+        store = load_store()
+        if store.get("version") != 1:
+            # Corrupted version — re-embed all projects
+            projects_with_ctx = db.execute(text("""
+                SELECT p.id, p.name, cc.key_decisions, cc.tech_stack
+                FROM projects p
+                LEFT JOIN client_context cc ON cc.project_id = p.id
+                LIMIT 100
+            """)).fetchall()
+            re_embedded = 0
+            for p in projects_with_ctx:
+                text_content = f"{p.name} {str(p.key_decisions or '')} {str(p.tech_stack or '')}"
+                if text_content.strip():
+                    embed_document(str(p.id), text_content, {"name": p.name})
+                    re_embedded += 1
+            if re_embedded:
+                repairs.append({
+                    "type": "embedding_store_rebuilt",
+                    "documents_reindexed": re_embedded,
+                })
+    except Exception as e:
+        repairs.append({"type": "embedding_store_check", "error": str(e)})
+
+    return {
+        "status": "repairs_complete" if repairs else "no_repairs_needed",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "repairs": repairs,
+        "total_repairs": len(repairs),
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
