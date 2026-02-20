@@ -17,14 +17,6 @@ DATABASE_URL = os.environ.get(
     "postgresql://localhost:5432/agenticmakebuilder",
 )
 
-# Debug: log the host portion of the URL (never log credentials)
-try:
-    from urllib.parse import urlparse
-    _parsed = urlparse(DATABASE_URL)
-    print(f">>> DB target: user={_parsed.username} host={_parsed.hostname} port={_parsed.port}")
-except Exception:
-    pass
-
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
