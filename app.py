@@ -1412,6 +1412,108 @@ def pipeline_status(project_id: str = Query(...), db: Session = Depends(get_db))
     }
 
 
+@app.post("/briefing")
+def briefing(db: Session = Depends(get_db)):
+    """
+    Daily supervisor briefing. Returns markdown report with:
+    - All active projects summary
+    - Stalled projects list
+    - Overnight activity (last 24h)
+    - Failures in last 24h
+    """
+    now = datetime.now(timezone.utc)
+    day_ago = now.isoformat()
+
+    # Active projects
+    active = db.execute(text("""
+        SELECT p.id, p.name, p.customer_name, p.status,
+               pas.current_stage, pas.current_agent, pas.pipeline_health, pas.updated_at
+        FROM projects p
+        LEFT JOIN project_agent_state pas ON pas.project_id = p.id
+        WHERE p.status NOT IN ('deployed', 'cancelled')
+        ORDER BY p.updated_at DESC NULLS LAST
+    """)).fetchall()
+
+    # Stalled
+    stalled = db.execute(text("""
+        SELECT p.name, p.customer_name,
+               EXTRACT(EPOCH FROM (now() - p.updated_at)) / 3600 AS hours
+        FROM projects p
+        WHERE p.updated_at < now() - interval '48 hours'
+          AND p.status NOT IN ('deployed', 'cancelled')
+        ORDER BY p.updated_at ASC
+    """)).fetchall()
+
+    # Recent builds (last 24h)
+    recent_builds = db.execute(text("""
+        SELECT b.slug, b.version, b.status, b.confidence_score,
+               b.confidence_grade, b.created_at, p.name AS project_name
+        FROM builds b
+        JOIN projects p ON p.id = b.project_id
+        WHERE b.created_at > now() - interval '24 hours'
+        ORDER BY b.created_at DESC
+    """)).fetchall()
+
+    # Failures in last 24h
+    failures = [b for b in recent_builds if b.status == "failed"]
+
+    # Build markdown
+    lines = [
+        f"# Daily Supervisor Briefing",
+        f"**Generated:** {now.strftime('%Y-%m-%d %H:%M UTC')}",
+        "",
+        f"## Active Projects ({len(active)})",
+        "",
+    ]
+
+    if active:
+        lines.append("| Project | Client | Stage | Agent | Health |")
+        lines.append("|---------|--------|-------|-------|--------|")
+        for a in active:
+            lines.append(
+                f"| {a.name} | {a.customer_name or '-'} | "
+                f"{a.current_stage or '-'} | {a.current_agent or '-'} | "
+                f"{a.pipeline_health or '-'} |"
+            )
+    else:
+        lines.append("No active projects.")
+
+    lines.extend(["", f"## Stalled Projects ({len(stalled)})", ""])
+    if stalled:
+        for s in stalled:
+            lines.append(f"- **{s.name}** ({s.customer_name}) — stalled {round(s.hours, 1)}h")
+    else:
+        lines.append("None.")
+
+    lines.extend(["", f"## Last 24h Activity ({len(recent_builds)} builds)", ""])
+    if recent_builds:
+        for b in recent_builds:
+            grade = f" [{b.confidence_grade}]" if b.confidence_grade else ""
+            lines.append(f"- {b.project_name}/{b.slug} v{b.version} — {b.status}{grade}")
+    else:
+        lines.append("No build activity.")
+
+    lines.extend(["", f"## Failures ({len(failures)})", ""])
+    if failures:
+        for f_ in failures:
+            lines.append(f"- **{f_.slug}** v{f_.version} — FAILED")
+    else:
+        lines.append("No failures.")
+
+    report = "\n".join(lines)
+
+    return {
+        "report": report,
+        "summary": {
+            "active_projects": len(active),
+            "stalled_projects": len(stalled),
+            "builds_24h": len(recent_builds),
+            "failures_24h": len(failures),
+        },
+        "generated_at": now.isoformat(),
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
