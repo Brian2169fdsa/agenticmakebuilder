@@ -407,6 +407,20 @@ def plan(request: AssessRequest, db: Session = Depends(get_db)):
             }
         )
 
+    # Sync activity to Supabase
+    try:
+        from tools.pipeline_sync import sync_activity
+        build_project_id = build_result.get("project_id") or build_result.get("build_id")
+        if build_project_id:
+            sync_activity(
+                project_id=str(build_project_id),
+                action_type="build_started",
+                description="Build plan generated",
+                agent_name="agenticmakebuilder",
+            )
+    except Exception:
+        pass  # Non-critical
+
     response = {
         "ready_for_build": True,
         "success": True,
@@ -627,6 +641,19 @@ def verify(request: VerifyRequest, db: Session = Depends(get_db)):
                     auto_advanced = True
         except Exception:
             db.rollback()
+
+    # Sync verification to Supabase
+    if request.project_id:
+        try:
+            from tools.pipeline_sync import sync_build_verification
+            sync_build_verification(
+                project_id=request.project_id,
+                confidence_score=score_100,
+                passed=passed,
+                fix_instructions=fix_instructions if fix_instructions else None,
+            )
+        except Exception:
+            pass  # Non-critical
 
     result = {
         "confidence_score": score_100,
@@ -1117,6 +1144,18 @@ def supervisor_stalled(db: Session = Depends(get_db)):
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         })
 
+    # Send stall alerts to Supabase for each stalled project
+    if stalled:
+        try:
+            from tools.notification_sender import send_stall_alert
+            for s in stalled:
+                send_stall_alert(
+                    project_id=s["project_id"],
+                    days_stalled=s["hours_stalled"] / 24,
+                )
+        except Exception:
+            pass  # Non-critical
+
     return {
         "stalled_count": len(stalled),
         "stalled_projects": stalled,
@@ -1211,6 +1250,25 @@ def costs_track(request: CostTrackRequest, db: Session = Depends(get_db)):
                 "level": "warning",
                 "message": f"Cost is within 20% of revenue. Current margin: {margin_pct:.1f}%",
             }
+
+    # Sync financials to Supabase
+    try:
+        from tools.pipeline_sync import sync_project_financials
+        sync_project_financials(
+            project_id=request.project_id,
+            revenue=revenue,
+            api_cost=cumulative_cost,
+        )
+    except Exception:
+        pass  # Non-critical
+
+    # Send cost alert notification if margin < 20%
+    if revenue > 0 and margin_pct < 20:
+        try:
+            from tools.notification_sender import send_cost_alert
+            send_cost_alert(project_id=request.project_id, margin_pct=margin_pct)
+        except Exception:
+            pass  # Non-critical
 
     return {
         "id": str(record.id),
@@ -1607,6 +1665,18 @@ def orchestrate(request: OrchestrateRequest, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update pipeline state: {str(e)}")
 
+    # Sync pipeline state to Supabase
+    try:
+        from tools.pipeline_sync import sync_project_state
+        sync_project_state(
+            project_id=str(project_uuid),
+            stage=stage,
+            agent_name=next_agent,
+            context_bundle=context_bundle,
+        )
+    except Exception:
+        pass  # Non-critical
+
     return {
         "project_id": str(project_uuid),
         "current_stage": stage,
@@ -1702,6 +1772,18 @@ def agent_complete(request: AgentCompleteRequest, db: Session = Depends(get_db))
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+    # Sync agent handoff activity to Supabase
+    try:
+        from tools.pipeline_sync import sync_activity
+        sync_activity(
+            project_id=str(project_uuid),
+            action_type="agent_handoff",
+            description=f"{request.agent_name} completed: {request.outcome}",
+            agent_name=request.agent_name,
+        )
+    except Exception:
+        pass  # Non-critical
 
     return {
         "project_id": str(project_uuid),
