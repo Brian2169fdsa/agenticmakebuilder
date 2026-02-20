@@ -5243,30 +5243,6 @@ def enqueue_job_endpoint(request: JobEnqueueRequest, db: Session = Depends(get_d
     }
 
 
-@app.get("/jobs/{job_id}")
-def get_job_endpoint(job_id: str, db: Session = Depends(get_db)):
-    """Get job status and result."""
-    from tools.job_queue import get_job
-    job = get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    elapsed = None
-    if job.get("created_at"):
-        try:
-            created = job["created_at"]
-            if isinstance(created, str):
-                from datetime import datetime as dt
-                created = dt.fromisoformat(created.replace("Z", "+00:00"))
-            elapsed = (datetime.now(timezone.utc) - created).total_seconds()
-        except Exception:
-            pass
-
-    job["elapsed_seconds"] = round(elapsed, 1) if elapsed else None
-    job["is_complete"] = job.get("status") in ("completed", "failed", "cancelled")
-    return job
-
-
 @app.get("/jobs/list")
 def list_jobs_endpoint(
     status: Optional[str] = None,
@@ -5314,19 +5290,43 @@ def list_jobs_endpoint(
     return {"jobs": jobs, "total": len(jobs), "stats": stats}
 
 
+@app.get("/jobs/stats")
+def job_stats_endpoint(db: Session = Depends(get_db)):
+    """Job queue statistics."""
+    from tools.job_queue import get_job_stats
+    return get_job_stats()
+
+
+@app.get("/jobs/{job_id}")
+def get_job_endpoint(job_id: str, db: Session = Depends(get_db)):
+    """Get job status and result."""
+    from tools.job_queue import get_job
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    elapsed = None
+    if job.get("created_at"):
+        try:
+            created = job["created_at"]
+            if isinstance(created, str):
+                from datetime import datetime as dt
+                created = dt.fromisoformat(created.replace("Z", "+00:00"))
+            elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+        except Exception:
+            pass
+
+    job["elapsed_seconds"] = round(elapsed, 1) if elapsed else None
+    job["is_complete"] = job.get("status") in ("completed", "failed", "cancelled")
+    return job
+
+
 @app.delete("/jobs/{job_id}/cancel")
 def cancel_job_endpoint(job_id: str, db: Session = Depends(get_db)):
     """Cancel a pending job."""
     from tools.job_queue import cancel_job
     cancelled = cancel_job(job_id)
     return {"cancelled": cancelled, "job_id": job_id}
-
-
-@app.get("/jobs/stats")
-def job_stats_endpoint(db: Session = Depends(get_db)):
-    """Job queue statistics."""
-    from tools.job_queue import get_job_stats
-    return get_job_stats()
 
 
 @app.post("/jobs/cleanup")
