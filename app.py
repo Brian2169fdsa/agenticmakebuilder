@@ -4520,3 +4520,66 @@ def admin_system_status(db: Session = Depends(get_db)):
         "costs": cost_stats,
         "personas": persona_stats,
     }
+
+
+# ── POST /admin/reindex ─────────────────────────────────────────
+
+
+@app.post("/admin/reindex")
+def admin_reindex(db: Session = Depends(get_db)):
+    """
+    Re-embed all client_context records into the TF-IDF store.
+
+    Reads all client_context rows, extracts text from key_decisions and
+    tech_stack, and re-embeds each into /data/embeddings.json.
+    """
+    import time
+    from tools.embedding_engine import embed_document
+
+    start = time.time()
+
+    try:
+        rows = db.execute(text("""
+            SELECT cc.client_id, cc.project_id,
+                   cc.key_decisions, cc.tech_stack, cc.failure_patterns
+            FROM client_context cc
+        """)).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    reindexed = 0
+    skipped = 0
+
+    for row in rows:
+        # Build text from context fields
+        parts = []
+        if row.key_decisions:
+            decisions = row.key_decisions if isinstance(row.key_decisions, list) else []
+            parts.extend(str(d) for d in decisions)
+        if row.tech_stack:
+            stack = row.tech_stack if isinstance(row.tech_stack, list) else []
+            parts.extend(str(t) for t in stack)
+        if row.failure_patterns:
+            patterns = row.failure_patterns if isinstance(row.failure_patterns, list) else []
+            parts.extend(str(p) for p in patterns)
+
+        text_content = " ".join(parts).strip()
+        if not text_content:
+            skipped += 1
+            continue
+
+        try:
+            doc_id = f"{row.client_id}:{row.project_id}"
+            embed_document(doc_id, text_content)
+            reindexed += 1
+        except Exception:
+            skipped += 1
+
+    duration_ms = round((time.time() - start) * 1000)
+
+    return {
+        "reindexed_count": reindexed,
+        "skipped_count": skipped,
+        "total_records": len(rows),
+        "duration_ms": duration_ms,
+    }
