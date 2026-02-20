@@ -1385,3 +1385,119 @@ def _extract_feedback_themes(notes_list: list[str], top_n: int = 5) -> list[dict
         {"theme": word, "count": count}
         for word, count in word_counts.most_common(top_n)
     ]
+
+
+# ─────────────────────────────────────────
+# POST /persona/deploy
+# ─────────────────────────────────────────
+
+# Base persona definitions — baked-in defaults per persona
+_PERSONA_DEFAULTS = {
+    "rebecka": {
+        "display_name": "Rebecka",
+        "role": "Strategic Account Manager",
+        "base_tone": "warm, consultative, empathetic",
+        "base_style": "Builds rapport first, then addresses business needs. Uses collaborative language.",
+        "knowledge_bases": ["client-success-playbook", "account-management-sops", "upsell-frameworks"],
+    },
+    "daniel": {
+        "display_name": "Daniel",
+        "role": "Technical Solutions Architect",
+        "base_tone": "direct, precise, confident",
+        "base_style": "Leads with data and technical detail. Concise, action-oriented communication.",
+        "knowledge_bases": ["make-platform-docs", "integration-patterns", "api-reference", "troubleshooting-guides"],
+    },
+    "sarah": {
+        "display_name": "Sarah",
+        "role": "Client Success Lead",
+        "base_tone": "encouraging, proactive, clear",
+        "base_style": "Focuses on outcomes and next steps. Balances optimism with transparency.",
+        "knowledge_bases": ["onboarding-workflows", "client-health-metrics", "escalation-procedures"],
+    },
+    "andrew": {
+        "display_name": "Andrew",
+        "role": "Operations & Delivery Manager",
+        "base_tone": "structured, reliable, thorough",
+        "base_style": "Process-driven communication. Uses checklists and status updates. Deadline-conscious.",
+        "knowledge_bases": ["delivery-sops", "project-templates", "sla-guidelines", "resource-planning"],
+    },
+}
+
+
+class PersonaDeployRequest(BaseModel):
+    persona: str
+    client_id: str
+    config_overrides: Optional[dict] = None
+
+
+@app.post("/persona/deploy")
+def persona_deploy(request: PersonaDeployRequest, db: Session = Depends(get_db)):
+    """
+    Generate a client-specific persona artifact.
+
+    Merges the base persona definition with any stored client context
+    and the provided config_overrides. Returns a deployable persona
+    artifact with custom name, tone, knowledge base references, and
+    system prompt baked in.
+    """
+    persona = _validate_persona(request.persona)
+
+    if not request.client_id.strip():
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    base = _PERSONA_DEFAULTS[persona]
+    overrides = request.config_overrides or {}
+
+    # Fetch stored client context if it exists
+    ctx = (
+        db.query(PersonaClientContext)
+        .filter(
+            PersonaClientContext.persona == persona,
+            PersonaClientContext.client_id == request.client_id.strip(),
+        )
+        .first()
+    )
+
+    # Build the merged artifact
+    display_name = overrides.get("display_name", base["display_name"])
+    role = overrides.get("role", base["role"])
+    tone = overrides.get("tone", ctx.tone_preferences if ctx and ctx.tone_preferences else base["base_tone"])
+    style = overrides.get("communication_style", ctx.communication_style if ctx and ctx.communication_style else base["base_style"])
+    knowledge_bases = overrides.get("knowledge_bases", base["knowledge_bases"])
+    extra_knowledge = overrides.get("extra_knowledge_bases", [])
+    if extra_knowledge:
+        knowledge_bases = list(set(knowledge_bases + extra_knowledge))
+
+    past_context = ctx.past_interactions_summary if ctx and ctx.past_interactions_summary else None
+
+    # Generate system prompt
+    system_prompt = (
+        f"You are {display_name}, {role} at ManageAI.\n\n"
+        f"Tone: {tone if isinstance(tone, str) else ', '.join(f'{k}: {v}' for k, v in tone.items()) if isinstance(tone, dict) else str(tone)}\n"
+        f"Communication style: {style}\n\n"
+        f"Knowledge bases available: {', '.join(knowledge_bases)}\n"
+    )
+
+    if past_context:
+        system_prompt += f"\nClient context from past interactions:\n{past_context}\n"
+
+    system_prompt += (
+        f"\nYou are speaking with client '{request.client_id.strip()}'.\n"
+        "Always stay in character. Be helpful, accurate, and professional."
+    )
+
+    artifact = {
+        "persona": persona,
+        "client_id": request.client_id.strip(),
+        "display_name": display_name,
+        "role": role,
+        "tone": tone,
+        "communication_style": style,
+        "knowledge_bases": knowledge_bases,
+        "past_interactions_summary": past_context,
+        "system_prompt": system_prompt,
+        "config_overrides_applied": overrides,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return artifact
