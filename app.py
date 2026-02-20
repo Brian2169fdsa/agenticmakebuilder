@@ -1514,6 +1514,118 @@ def briefing(db: Session = Depends(get_db)):
     }
 
 
+# ═══════════════════════════════════════════════════════════════
+# BLOCK 2 — AGENT MEMORY & LEARNING
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/memory")
+def memory_store(request: MemoryRequest, db: Session = Depends(get_db)):
+    """
+    Store client context: key_decisions, tech_stack, failure_patterns.
+    Upserts on client_id + project_id.
+    """
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    if not request.client_id.strip():
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    now = datetime.now(timezone.utc)
+    existing = db.query(ClientContext).filter(
+        ClientContext.client_id == request.client_id.strip(),
+        ClientContext.project_id == project_uuid,
+    ).first()
+
+    if existing:
+        if request.key_decisions is not None:
+            existing.key_decisions = request.key_decisions
+        if request.tech_stack is not None:
+            existing.tech_stack = request.tech_stack
+        if request.failure_patterns is not None:
+            existing.failure_patterns = request.failure_patterns
+        existing.updated_at = now
+        db.commit()
+        db.refresh(existing)
+        record = existing
+    else:
+        record = ClientContext(
+            client_id=request.client_id.strip(),
+            project_id=project_uuid,
+            key_decisions=request.key_decisions,
+            tech_stack=request.tech_stack,
+            failure_patterns=request.failure_patterns,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+
+    return {
+        "id": str(record.id),
+        "client_id": record.client_id,
+        "project_id": str(record.project_id),
+        "key_decisions": record.key_decisions,
+        "tech_stack": record.tech_stack,
+        "failure_patterns": record.failure_patterns,
+        "updated_at": record.updated_at.isoformat(),
+    }
+
+
+@app.get("/memory")
+def memory_get(client_id: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Full aggregated context for a client across all projects.
+    Merges key_decisions, tech_stack, failure_patterns from all projects.
+    """
+    if not client_id.strip():
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    rows = db.query(ClientContext).filter(
+        ClientContext.client_id == client_id.strip()
+    ).all()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No memory found for client '{client_id}'")
+
+    all_decisions = []
+    all_tech = set()
+    all_failures = []
+    projects = []
+
+    for r in rows:
+        projects.append({
+            "project_id": str(r.project_id),
+            "key_decisions": r.key_decisions,
+            "tech_stack": r.tech_stack,
+            "failure_patterns": r.failure_patterns,
+            "updated_at": r.updated_at.isoformat(),
+        })
+        if r.key_decisions:
+            all_decisions.extend(r.key_decisions)
+        if r.tech_stack:
+            all_tech.update(r.tech_stack)
+        if r.failure_patterns:
+            all_failures.extend(r.failure_patterns)
+
+    return {
+        "client_id": client_id,
+        "project_count": len(rows),
+        "aggregated": {
+            "key_decisions": all_decisions,
+            "tech_stack": sorted(all_tech),
+            "failure_patterns": all_failures,
+        },
+        "projects": projects,
+    }
+
+
 def _audit_recommendations(errors, warnings, confidence):
     """Generate plain-English recommendations from audit results."""
     recs = []
