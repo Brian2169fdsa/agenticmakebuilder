@@ -3423,3 +3423,66 @@ def persona_test(request: PersonaTestRequest, db: Session = Depends(get_db)):
         "client_id": request.client_id.strip() if request.client_id else None,
         "model": "claude-sonnet-4-20250514",
     }
+
+
+# ── GET /personas/list ─────────────────────────────────────────
+
+
+@app.get("/personas/list")
+def personas_list(db: Session = Depends(get_db)):
+    """
+    Return all 4 personas with their base info and live stats.
+
+    Stats are pulled from persona_feedback (avg_rating, total_interactions)
+    and persona_client_context (unique_clients, last_deployed approximation).
+    Always returns all 4 personas even if no DB data exists yet.
+    """
+    results = []
+
+    for persona_key, base in _PERSONA_DEFAULTS.items():
+        # Aggregate feedback stats
+        fb_row = db.execute(
+            text(
+                "SELECT COUNT(*) AS total, COALESCE(AVG(rating), 0) AS avg_rating "
+                "FROM persona_feedback WHERE persona = :p"
+            ),
+            {"p": persona_key},
+        ).first()
+
+        total_interactions = fb_row.total if fb_row else 0
+        avg_rating = round(float(fb_row.avg_rating), 2) if fb_row else 0.0
+
+        # Count unique clients with stored context
+        client_row = db.execute(
+            text(
+                "SELECT COUNT(*) AS cnt FROM persona_client_context WHERE persona = :p"
+            ),
+            {"p": persona_key},
+        ).first()
+        unique_clients = client_row.cnt if client_row else 0
+
+        # Most recent context update as proxy for last_deployed
+        last_row = db.execute(
+            text(
+                "SELECT updated_at FROM persona_client_context "
+                "WHERE persona = :p ORDER BY updated_at DESC LIMIT 1"
+            ),
+            {"p": persona_key},
+        ).first()
+        last_deployed = last_row.updated_at.isoformat() if last_row and last_row.updated_at else None
+
+        results.append({
+            "persona": persona_key,
+            "display_name": base["display_name"],
+            "role": base["role"],
+            "base_tone": base["base_tone"],
+            "knowledge_bases": base["knowledge_bases"],
+            "stats": {
+                "avg_rating": avg_rating,
+                "total_interactions": total_interactions,
+                "unique_clients": unique_clients,
+                "last_deployed": last_deployed,
+            },
+        })
+
+    return {"personas": results, "total": len(results)}
