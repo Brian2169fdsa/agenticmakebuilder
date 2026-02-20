@@ -148,7 +148,8 @@ class TestAdminReindex:
         row.failure_patterns = []
         mock_db.execute.return_value.fetchall.return_value = [row]
 
-        r = client.post("/admin/reindex")
+        with patch("tools.embedding_engine.embed_document") as mock_embed:
+            r = client.post("/admin/reindex")
         assert r.status_code == 200
         body = r.json()
         assert body["total_records"] == 1
