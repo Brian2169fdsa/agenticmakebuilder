@@ -1,8 +1,8 @@
-# agenticmakebuilder v2.0.0
+# agenticmakebuilder v2.1.0
 
 ![Python 3.13](https://img.shields.io/badge/Python-3.13-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?logo=fastapi&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-39%20passing-brightgreen?logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/Tests-59%20passing-brightgreen?logo=pytest&logoColor=white)
 ![Endpoints](https://img.shields.io/badge/Endpoints-35-orange)
 
 ## What It Does
@@ -193,7 +193,7 @@ pip install pytest httpx
 # Run full suite
 pytest tests/ -v
 
-# Expected: 39 passed
+# Expected: 59 passed
 ```
 
 Tests mock the database layer so no Postgres connection is needed to run them.

@@ -1,5 +1,5 @@
 """
-Agentic Make Builder — FastAPI Application (v2.0.0)
+Agentic Make Builder — FastAPI Application (v2.1.0)
 
 Endpoints (35 total):
 
@@ -3613,3 +3613,73 @@ def personas_list(db: Session = Depends(get_db)):
         })
 
     return {"personas": results, "total": len(results)}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SPRINT 4 — INTELLIGENCE LAYER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+# ── POST /clients/health ────────────────────────────────────────
+
+
+@app.post("/clients/health")
+def clients_health(db: Session = Depends(get_db)):
+    """
+    Assess health of all clients based on pipeline activity.
+
+    For each distinct customer_name: counts projects, stalled projects
+    (updated_at > 48h and status not deployed/cancelled), and determines
+    health_status: healthy, at_risk, or unhealthy.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT
+                COALESCE(p.customer_name, 'Unknown') AS client_id,
+                COUNT(p.id) AS project_count,
+                MAX(p.updated_at) AS last_activity,
+                COUNT(CASE
+                    WHEN p.updated_at < now() - interval '48 hours'
+                         AND p.status NOT IN ('deployed', 'cancelled')
+                    THEN 1
+                END) AS stalled_count,
+                EXTRACT(EPOCH FROM (now() - MAX(p.updated_at))) / 86400 AS days_inactive
+            FROM projects p
+            GROUP BY COALESCE(p.customer_name, 'Unknown')
+            ORDER BY last_activity DESC NULLS LAST
+        """)).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    clients = []
+    for row in rows:
+        stalled = int(row.stalled_count)
+        days_inactive = float(row.days_inactive) if row.days_inactive else 0
+
+        if stalled >= 2 or days_inactive > 7:
+            health_status = "unhealthy"
+            reason = f"{stalled} stalled projects" if stalled >= 2 else f"No activity for {round(days_inactive, 1)} days"
+        elif stalled >= 1 or days_inactive > 5:
+            health_status = "at_risk"
+            reason = f"{stalled} stalled project(s)" if stalled >= 1 else f"No activity for {round(days_inactive, 1)} days"
+        else:
+            health_status = "healthy"
+            reason = "All projects active"
+
+        clients.append({
+            "client_id": row.client_id,
+            "health_status": health_status,
+            "stalled_count": stalled,
+            "project_count": int(row.project_count),
+            "last_activity": row.last_activity.isoformat() if row.last_activity else None,
+            "days_inactive": round(days_inactive, 1),
+            "reason": reason,
+        })
+
+    summary = {
+        "healthy": sum(1 for c in clients if c["health_status"] == "healthy"),
+        "at_risk": sum(1 for c in clients if c["health_status"] == "at_risk"),
+        "unhealthy": sum(1 for c in clients if c["health_status"] == "unhealthy"),
+    }
+
+    return {"clients": clients, "total": len(clients), "summary": summary}
