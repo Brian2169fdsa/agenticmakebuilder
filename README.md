@@ -1,9 +1,10 @@
-# agenticmakebuilder v2.2.0
+# agenticmakebuilder v2.3.0
 
 ![Python 3.13](https://img.shields.io/badge/Python-3.13-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?logo=fastapi&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-87%20passing-brightgreen?logo=pytest&logoColor=white)
-![Endpoints](https://img.shields.io/badge/Endpoints-51-orange)
+![Tests](https://img.shields.io/badge/Tests-141%20passing-brightgreen?logo=pytest&logoColor=white)
+![Endpoints](https://img.shields.io/badge/Endpoints-56-orange)
+![Make.com](https://img.shields.io/badge/Make.com-Live%20Deploy-7B68EE)
 
 ## What It Does
 
@@ -84,13 +85,25 @@ curl http://localhost:8000/health
 | GET | `/confidence/history` | Verification run history with score trends | `?project_id=` |
 | GET | `/confidence/trend` | Confidence score trend (improving/declining/stable) | `?project_id=` |
 
-### Deployment Agent (3 endpoints)
+### Deployment Agent (8 endpoints)
 
 | Method | Endpoint | Description | Key Params |
 |--------|----------|-------------|------------|
-| POST | `/deploy/makecom` | Deploy blueprint to Make.com via API | `project_id`, `blueprint`, `api_key` |
+| POST | `/deploy/makecom` | Deploy blueprint to Make.com via API (live or simulation) | `project_id`, `blueprint`, `scenario_name` |
+| POST | `/deploy/run` | Trigger a deployed scenario execution | `scenario_id`, `data` |
+| GET | `/deploy/list` | List all deployments with status | `?project_id=` |
+| POST | `/deploy/teardown` | Deactivate + delete a deployed scenario | `scenario_id`, `project_id` |
+| GET | `/deploy/monitor` | Health check all active deployments | — |
 | POST | `/deploy/n8n` | Deploy workflow to n8n via REST API | `project_id`, `workflow`, `n8n_url`, `api_key` |
 | GET | `/deploy/status` | Deployment status + health checks | `?project_id=` |
+| POST | `/webhook/makecom` | Receive Make.com execution events | `scenario_id`, `status` |
+
+### Learning Feedback Loop (2 endpoints)
+
+| Method | Endpoint | Description | Key Params |
+|--------|----------|-------------|------------|
+| POST | `/learn/outcome` | Record deployment outcome + embed for similarity | `scenario_id`, `project_id`, `outcome` |
+| GET | `/learn/insights` | Get risk assessment from past deployment data | `?description=` |
 
 ### Cost & Margin Intelligence (4 endpoints)
 
@@ -146,7 +159,7 @@ curl http://localhost:8000/health
 ## Architecture
 
 ```
-                         agenticmakebuilder v2.2.0
+                         agenticmakebuilder v2.3.0
   ┌─────────────────────────────────────────────────────────────────┐
   │                                                                 │
   │   Client                                                        │
@@ -180,7 +193,23 @@ curl http://localhost:8000/health
   │   │ Vectors    │ │ Margin    │ │ Auto-fix   │ │  audit   │    │
   │   └────────────┘ │ Alerts    │ └────────────┘ └──────────┘    │
   │                  └───────────┘                                  │
-  │                       │                                         │
+  │                                                                 │
+  │   ┌──────────────────────────────────────────────┐              │
+  │   │   MAKE.COM DEPLOYMENT ENGINE (v2.3.0)        │              │
+  │   │                                              │              │
+  │   │  makecom_client.py    → REST API (httpx)     │              │
+  │   │  blueprint_builder.py → plan → blueprint     │              │
+  │   │  execution_monitor.py → health checks        │              │
+  │   │                                              │              │
+  │   │  /deploy/makecom   Create + activate         │              │
+  │   │  /deploy/run       Trigger execution         │              │
+  │   │  /deploy/teardown  Deactivate + delete       │              │
+  │   │  /deploy/monitor   Health check all          │              │
+  │   │  /webhook/makecom  Receive events            │              │
+  │   │  /learn/outcome    Record + embed            │              │
+  │   │  /learn/insights   Risk assessment           │              │
+  │   └──────────────────────────────────────────────┘              │
+  │                                                                 │
   │   ┌──────────────────────────────────────────────┐              │
   │   │   SUPABASE SYNC LAYER                        │              │
   │   │                                              │              │
@@ -206,9 +235,11 @@ curl http://localhost:8000/health
 |----------|----------|-------------|
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `ANTHROPIC_API_KEY` | No | Anthropic API key for persona test endpoint |
-| `MAKE_API_KEY` | No | Make.com API token for deployment + monitoring |
-| `MAKE_TEAM_ID` | No | Make.com team ID |
-| `MAKE_API_BASE` | No | Make.com API base URL (default: `https://us1.make.com/api/v2`) |
+| `MAKECOM_API_KEY` | No | Make.com API token for live deployment + monitoring |
+| `MAKECOM_TEAM_ID` | No | Make.com team ID (e.g. `1179790`) |
+| `MAKECOM_ORG_ID` | No | Make.com organization ID (e.g. `4696307`) |
+| `MAKECOM_API_BASE` | No | Make.com API base URL (default: `https://us2.make.com/api/v2`) |
+| `MAKECOM_WEBHOOK_SECRET` | No | Shared secret for webhook event verification |
 | `SLACK_WEBHOOK_URL` | No | Slack webhook for incident notifications |
 | `MANAGEAI_HOURLY_RATE` | No | Hourly rate for SOW estimates (default: `150`) |
 | `MONITOR_INTERVAL` | No | Execution poller interval in seconds (default: `900`) |
@@ -228,10 +259,10 @@ pip install pytest httpx
 # Run full suite
 pytest tests/ -v
 
-# Expected: 87 passed
+# Expected: 141 passed
 ```
 
-Tests mock the database layer so no Postgres connection is needed to run them.
+Tests mock the database layer and Make.com API so no external connections are needed to run them.
 
 ## Deployment (Railway)
 
