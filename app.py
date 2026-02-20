@@ -2917,8 +2917,7 @@ def learn_outcome(request: LearnOutcomeRequest):
     Record deployment outcome and embed it for future learning.
     Feeds success/failure data back into the similarity engine.
     """
-    from tools.embedding_engine import EmbeddingEngine
-    engine = EmbeddingEngine()
+    from tools.embedding_engine import embed_document
 
     error_str = ", ".join(request.error_patterns) if request.error_patterns else "none"
     learning_summary = (
@@ -2927,7 +2926,7 @@ def learn_outcome(request: LearnOutcomeRequest):
         f"Avg duration: {request.avg_duration_ms:.0f}ms. Patterns: {error_str}"
     )
 
-    engine.add_document(request.project_id, learning_summary, {"outcome": request.outcome})
+    embed_document(request.project_id, learning_summary, {"outcome": request.outcome})
 
     return {
         "learned": True,
@@ -2944,19 +2943,19 @@ def learn_insights(description: str = Query(...), top_n: int = 3):
     Search past deployment outcomes similar to description.
     Returns risk assessment based on historical success/failure.
     """
-    from tools.embedding_engine import EmbeddingEngine
-    engine = EmbeddingEngine()
+    from tools.embedding_engine import find_similar
 
-    results = engine.search(description, top_n=top_n)
+    results = find_similar(description, top_n=top_n)
 
     outcomes = []
     success_count = 0
     failure_count = 0
-    for doc_id, score, metadata in results:
-        outcome = metadata.get("outcome", "unknown") if metadata else "unknown"
+    for r in results:
+        meta = r.get("metadata", {}) or {}
+        outcome = meta.get("outcome", "unknown")
         outcomes.append({
-            "project_id": doc_id,
-            "similarity": round(score, 3),
+            "project_id": r.get("id", ""),
+            "similarity": round(r.get("score", 0), 3),
             "outcome": outcome,
         })
         if outcome == "success":
