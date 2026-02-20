@@ -1,7 +1,7 @@
 """
-Agentic Make Builder — FastAPI Application (v2.1.0)
+Agentic Make Builder — FastAPI Application (v2.2.0)
 
-Endpoints (35 total):
+Endpoints (51 total):
 
   Core Pipeline:
     GET  /health              — liveness probe
@@ -14,14 +14,23 @@ Endpoints (35 total):
   Verification & Confidence:
     POST /verify              — 77-rule blueprint validation with fix instructions
     POST /verify/loop         — iterative verify → fix → verify cycle (max 5 iterations)
+    POST /verify/auto         — auto-verify + pipeline advance if confidence >= 85
     GET  /confidence/history  — verification run history with score trends
+    GET  /confidence/trend    — confidence score trend with improving/declining/stable
 
   Multi-Agent Orchestration:
     POST /orchestrate         — advance project through pipeline stages
     POST /agent/complete      — agent completion + auto-advance
     GET  /pipeline/status     — full pipeline state view
+    POST /pipeline/advance    — advance project to next/specific pipeline stage
+    GET  /pipeline/dashboard  — all projects grouped by pipeline stage
     POST /briefing            — daily supervisor briefing report
+    POST /briefing/daily      — comprehensive daily briefing with alerts + recommendations
     POST /handoff             — multi-agent handoff bridge
+
+  Intelligence Layer:
+    POST /clients/health      — client health assessment (healthy/at_risk/unhealthy)
+    GET  /clients/list        — client directory with project stats
 
   Agent Memory & Learning:
     POST /memory              — store client context (decisions, tech stack, patterns)
@@ -45,7 +54,16 @@ Endpoints (35 total):
     GET  /persona/context     — persona's full context for a client
     POST /persona/feedback    — store interaction feedback
     GET  /persona/performance — persona performance stats
-    POST /persona/deploy      — generate client-specific persona artifact
+    POST /persona/deploy      — generate client-specific persona artifact (v2.0)
+    POST /persona/test        — test persona via Claude API
+    GET  /personas/list       — all personas with live stats
+
+  Admin Control Plane:
+    POST /admin/reset-project — reset project pipeline to target stage
+    POST /admin/bulk-verify   — batch verify up to 10 projects
+    GET  /admin/system-status — full platform snapshot (DB, registry, costs, personas)
+    POST /admin/reindex       — re-embed all client context into TF-IDF store
+    GET  /admin/audit-log     — agent handoff audit trail
 
   Platform Health:
     GET  /health/full         — comprehensive health check (DB, tables, embeddings, pipeline)
@@ -64,7 +82,7 @@ HTTP status codes:
   404 — resource not found
   422 — validation failure (spec/export errors, confidence too low)
   500 — internal pipeline error
-  502 — upstream API error (Make.com, n8n)
+  502 — upstream API error (Make.com, n8n, Claude)
 """
 
 from contextlib import asynccontextmanager
@@ -114,7 +132,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Agentic Make Builder",
-    version="2.0.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
