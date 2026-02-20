@@ -286,3 +286,21 @@ CREATE TABLE IF NOT EXISTS persona_feedback (
 CREATE INDEX IF NOT EXISTS idx_persona_fb_persona ON persona_feedback(persona);
 CREATE INDEX IF NOT EXISTS idx_persona_fb_client ON persona_feedback(client_id);
 CREATE INDEX IF NOT EXISTS idx_persona_fb_interaction ON persona_feedback(interaction_id);
+
+-- ── Execution Events (Make.com webhook events) ──────────────
+
+CREATE TABLE IF NOT EXISTS execution_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scenario_id TEXT NOT NULL,
+    execution_id TEXT,
+    project_id TEXT,
+    status TEXT NOT NULL,
+    duration_ms INTEGER,
+    error_message TEXT,
+    module_count INTEGER,
+    raw_payload JSONB,
+    received_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_events_scenario ON execution_events(scenario_id);
+CREATE INDEX IF NOT EXISTS idx_execution_events_received ON execution_events(received_at DESC);

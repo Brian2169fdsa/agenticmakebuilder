@@ -1,7 +1,7 @@
 """
-Agentic Make Builder — FastAPI Application (v2.2.0)
+Agentic Make Builder — FastAPI Application (v2.3.0)
 
-Endpoints (51 total):
+Endpoints (59 total):
 
   Core Pipeline:
     GET  /health              — liveness probe
@@ -38,10 +38,21 @@ Endpoints (51 total):
     POST /memory/embed        — embed project brief for similarity search
     GET  /similar             — TF-IDF cosine similarity search
 
-  Deployment Agent:
-    POST /deploy/makecom      — deploy blueprint to Make.com via API
+  Deployment Agent (Live Make.com):
+    POST /deploy/makecom      — build blueprint + create + activate scenario in Make.com
     POST /deploy/n8n          — deploy workflow to n8n via REST API
     GET  /deploy/status       — deployment status + health checks
+    POST /deploy/run          — trigger single execution of a deployed scenario
+    GET  /deploy/list         — list all deployments with live Make.com status
+    POST /deploy/teardown     — deactivate + delete scenario from Make.com
+    GET  /deploy/monitor      — monitor all active deployments, return health summary
+
+  Webhook Listener:
+    POST /webhook/makecom     — receive Make.com execution events, detect failures
+
+  Learning Feedback Loop:
+    POST /learn/outcome       — record deployment outcome, embed for future learning
+    GET  /learn/insights      — search past outcomes, get risk assessment
 
   Cost & Margin Intelligence:
     POST /costs/track         — track token costs with auto-margin + alerts
@@ -132,7 +143,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Agentic Make Builder",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -228,8 +239,11 @@ class VerifyLoopRequest(BaseModel):
 class DeployMakecomRequest(BaseModel):
     project_id: str
     blueprint: dict
-    api_key: str
+    scenario_name: Optional[str] = "Agenticmakebuilder Scenario"
     team_id: Optional[int] = None
+    folder_id: Optional[int] = None
+    activate: Optional[bool] = True
+    api_key: Optional[str] = None  # Legacy — ignored if MAKECOM_API_KEY set
 
 
 class DeployN8nRequest(BaseModel):
@@ -253,6 +267,25 @@ class EmbedRequest(BaseModel):
     project_id: str
     brief: str
     outcome: Optional[str] = None
+
+
+class LearnOutcomeRequest(BaseModel):
+    scenario_id: str
+    project_id: str
+    outcome: str  # success | failure | partial
+    execution_count: Optional[int] = 0
+    avg_duration_ms: Optional[float] = 0
+    error_patterns: Optional[list] = None
+
+
+class DeployRunRequest(BaseModel):
+    scenario_id: int
+    data: Optional[dict] = None
+
+
+class DeployTeardownRequest(BaseModel):
+    scenario_id: int
+    project_id: str
 
 
 # ─────────────────────────────────────────
@@ -2389,12 +2422,14 @@ def confidence_history(project_id: str = Query(...), db: Session = Depends(get_d
 @app.post("/deploy/makecom")
 def deploy_makecom(request: DeployMakecomRequest, db: Session = Depends(get_db)):
     """
-    Deploy a blueprint to Make.com via their API.
+    Deploy a blueprint to Make.com via the API.
 
-    Imports the scenario blueprint, records the deployment in the deployments
-    table, and auto-advances the pipeline to completed status.
+    Builds a Make.com blueprint from plan_dict, creates the scenario,
+    optionally activates it, records the deployment, and advances pipeline.
+    Falls back to simulation mode if MAKECOM_API_KEY is not configured.
     """
-    import httpx
+    from tools.blueprint_builder import build_blueprint, validate_blueprint
+    from tools.makecom_client import get_makecom_client, MakecomError
 
     project_uuid = UUID(request.project_id)
 
@@ -2403,18 +2438,31 @@ def deploy_makecom(request: DeployMakecomRequest, db: Session = Depends(get_db))
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Build Make.com import payload
-    headers = {
-        "Authorization": f"Token {request.api_key}",
-        "Content-Type": "application/json",
-    }
-    team_id = request.team_id or 1
-    payload = {
-        "blueprint": request.blueprint,
-        "scheduling": {"type": "indefinitely", "interval": 900},
-        "teamId": team_id,
-    }
+    # Build Make.com blueprint from plan_dict
+    scenario_name = request.scenario_name or f"AMB-{request.project_id[:8]}"
+    built_blueprint = build_blueprint(request.blueprint, scenario_name)
 
+    # Validate
+    is_valid, bp_errors = validate_blueprint(built_blueprint)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail={"errors": bp_errors})
+
+    # Check if Make.com API is configured
+    try:
+        client = get_makecom_client()
+    except MakecomError:
+        # Simulation mode — no API key configured
+        return {
+            "deployed": False,
+            "simulation": True,
+            "reason": "MAKECOM_API_KEY not configured",
+            "scenario_id": None,
+            "scenario_name": scenario_name,
+            "blueprint_valid": True,
+            "module_count": len(built_blueprint.get("flow", [])),
+        }
+
+    # Create deployment record
     deployment_record = Deployment(
         project_id=project_uuid,
         target="make.com",
@@ -2425,23 +2473,45 @@ def deploy_makecom(request: DeployMakecomRequest, db: Session = Depends(get_db))
     db.refresh(deployment_record)
 
     try:
-        with httpx.Client(timeout=30) as client:
-            resp = client.post(
-                f"https://us1.make.com/api/v2/scenarios?teamId={team_id}",
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        # Create scenario in Make.com
+        scenario = client.create_scenario(
+            name=scenario_name,
+            blueprint=built_blueprint,
+            folder_id=request.folder_id,
+        )
+        scenario_id = scenario.get("id")
 
-        scenario = data.get("scenario", data)
-        deployment_record.external_id = str(scenario.get("id", ""))
-        deployment_record.external_url = f"https://us1.make.com/scenarios/{scenario.get('id', '')}"
+        # Activate if requested
+        activated = False
+        if request.activate and scenario_id:
+            try:
+                client.activate_scenario(scenario_id)
+                activated = True
+            except MakecomError:
+                activated = False
+
+        # Create webhook
+        hook_url = None
+        try:
+            hook = client.create_webhook(f"{scenario_name}-webhook")
+            hook_url = hook.get("url")
+        except MakecomError:
+            pass
+
+        # Determine Make.com base URL for the scenario link
+        base_url = client.base_url.replace("/api/v2", "")
+        make_url = f"{base_url}/scenarios/{scenario_id}" if scenario_id else None
+
+        # Update deployment record
+        deployment_record.external_id = str(scenario_id or "")
+        deployment_record.external_url = make_url
         deployment_record.status = "deployed"
         deployment_record.last_health_check = {
             "status": "deployed",
+            "activated": activated,
             "checked_at": datetime.now(timezone.utc).isoformat(),
-            "make_response": {"id": scenario.get("id"), "name": scenario.get("name")},
+            "make_response": {"id": scenario_id, "name": scenario.get("name")},
+            "hook_url": hook_url,
         }
         db.commit()
 
@@ -2455,35 +2525,48 @@ def deploy_makecom(request: DeployMakecomRequest, db: Session = Depends(get_db))
             state.updated_at = datetime.now(timezone.utc)
             history = state.stage_history or []
             history.append({
-                "stage": "deploy",
-                "agent": "deployer",
-                "target": "make.com",
-                "outcome": "success",
-                "external_id": str(scenario.get("id", "")),
+                "stage": "deploy", "agent": "deployer", "target": "make.com",
+                "outcome": "success", "external_id": str(scenario_id or ""),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             })
             state.stage_history = history
             db.commit()
 
+        # Sync to Supabase
+        try:
+            from tools.pipeline_sync import sync_activity, sync_project_state
+            sync_activity(request.project_id, "deployed",
+                          f"Deployed to Make.com as '{scenario_name}'", "deployment-agent")
+            sync_project_state(request.project_id, "deploy", "deployer")
+        except Exception:
+            pass
+
         return {
-            "success": True,
+            "deployed": True,
+            "scenario_id": scenario_id,
+            "scenario_name": scenario_name,
+            "hook_url": hook_url,
+            "activated": activated,
+            "make_url": make_url,
             "deployment_id": str(deployment_record.id),
-            "target": "make.com",
-            "external_id": deployment_record.external_id,
-            "external_url": deployment_record.external_url,
-            "status": "deployed",
+            "deployed_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    except httpx.HTTPStatusError as e:
+    except MakecomError as e:
         deployment_record.status = "failed"
         deployment_record.last_health_check = {
             "status": "failed",
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "error": str(e),
-            "status_code": e.response.status_code if e.response else None,
+            "status_code": e.status_code,
         }
         db.commit()
-        raise HTTPException(status_code=502, detail=f"Make.com API error: {str(e)}")
+        return {
+            "deployed": False,
+            "error": str(e),
+            "scenario_id": None,
+            "status_code": e.status_code,
+        }
 
     except Exception as e:
         deployment_record.status = "failed"
@@ -2629,6 +2712,279 @@ def deploy_status(project_id: str = Query(...), db: Session = Depends(get_db)):
     }
 
 
+@app.post("/deploy/run")
+def deploy_run(request: DeployRunRequest):
+    """Trigger a single execution of a deployed Make.com scenario."""
+    from tools.makecom_client import get_makecom_client, MakecomError
+
+    try:
+        client = get_makecom_client()
+    except MakecomError as e:
+        return {"error": "not_configured", "detail": str(e)}
+
+    try:
+        result = client.run_scenario(request.scenario_id, request.data)
+        return {
+            "scenario_id": request.scenario_id,
+            "status": "triggered",
+            "result": result,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except MakecomError as e:
+        raise HTTPException(status_code=502, detail=f"Make.com run error: {str(e)}")
+
+
+@app.get("/deploy/list")
+def deploy_list(project_id: Optional[str] = None, db: Session = Depends(get_db)):
+    """List deployments, optionally filtered by project_id."""
+    query = db.query(Deployment).order_by(Deployment.deployed_at.desc())
+    if project_id:
+        query = query.filter(Deployment.project_id == UUID(project_id))
+    deploys = query.limit(20).all()
+
+    results = []
+    for d in deploys:
+        entry = {
+            "id": str(d.id),
+            "project_id": str(d.project_id),
+            "target": d.target,
+            "external_id": d.external_id,
+            "external_url": d.external_url,
+            "status": d.status,
+            "last_health_check": d.last_health_check,
+            "deployed_at": d.deployed_at.isoformat() if d.deployed_at else None,
+        }
+        # Try to get live status from Make.com
+        if d.external_id and d.target == "make.com":
+            try:
+                from tools.makecom_client import get_makecom_client
+                mc = get_makecom_client()
+                live = mc.get_scenario(int(d.external_id))
+                entry["live_status"] = {
+                    "active": live.get("isActive", False),
+                    "name": live.get("name"),
+                    "last_edit": live.get("lastEdit"),
+                }
+            except Exception:
+                entry["live_status"] = None
+        results.append(entry)
+
+    return {"total": len(results), "deployments": results}
+
+
+@app.post("/deploy/teardown")
+def deploy_teardown(request: DeployTeardownRequest, db: Session = Depends(get_db)):
+    """Deactivate and delete a Make.com scenario, mark deployment as deleted."""
+    from tools.makecom_client import get_makecom_client, MakecomError
+
+    try:
+        client = get_makecom_client()
+    except MakecomError as e:
+        return {"deleted": False, "error": "not_configured", "detail": str(e)}
+
+    try:
+        try:
+            client.deactivate_scenario(request.scenario_id)
+        except MakecomError:
+            pass  # May already be inactive
+        client.delete_scenario(request.scenario_id)
+    except MakecomError as e:
+        raise HTTPException(status_code=502, detail=f"Make.com delete error: {str(e)}")
+
+    # Update deployment record
+    deploy = db.query(Deployment).filter(
+        Deployment.external_id == str(request.scenario_id)
+    ).first()
+    if deploy:
+        deploy.status = "deleted"
+        deploy.last_health_check = {
+            "status": "deleted",
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        db.commit()
+
+    # Sync activity
+    try:
+        from tools.pipeline_sync import sync_activity
+        sync_activity(request.project_id, "scenario_deleted",
+                      f"Scenario {request.scenario_id} deleted from Make.com", "deployment-agent")
+    except Exception:
+        pass
+
+    return {
+        "deleted": True,
+        "scenario_id": request.scenario_id,
+        "deleted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/deploy/monitor")
+def deploy_monitor(db: Session = Depends(get_db)):
+    """Monitor all active Make.com deployments and return health summary."""
+    from tools.execution_monitor import monitor_all_active_deployments
+
+    try:
+        results = monitor_all_active_deployments(db)
+    except Exception as e:
+        return {"error": str(e), "monitored_count": 0}
+
+    health_counts = {"healthy": 0, "degraded": 0, "failing": 0, "inactive": 0}
+    for r in results:
+        h = r.get("health", "inactive")
+        if h in health_counts:
+            health_counts[h] += 1
+
+    return {
+        "monitored_count": len(results),
+        **health_counts,
+        "scenarios": results,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/webhook/makecom")
+def webhook_makecom(payload: dict, db: Session = Depends(get_db)):
+    """
+    Receive execution events from Make.com webhooks.
+    Logs events, detects failures, and triggers alerts on consecutive errors.
+    """
+    scenario_id = str(payload.get("scenario_id", ""))
+    execution_id = str(payload.get("execution_id", ""))
+    status = payload.get("status", "unknown")
+    duration_ms = payload.get("duration_ms")
+    error_message = payload.get("error_message")
+
+    # Find associated deployment
+    deploy = db.query(Deployment).filter(
+        Deployment.external_id == scenario_id
+    ).first()
+    project_id = str(deploy.project_id) if deploy else None
+
+    # Insert execution event
+    try:
+        db.execute(text(
+            "INSERT INTO execution_events (scenario_id, execution_id, project_id, "
+            "status, duration_ms, error_message, raw_payload) "
+            "VALUES (:sid, :eid, :pid, :status, :dur, :err, :raw)"
+        ), {
+            "sid": scenario_id, "eid": execution_id, "pid": project_id,
+            "status": status, "dur": duration_ms, "err": error_message,
+            "raw": str(payload),
+        })
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    # On error, check for consecutive failures
+    if status == "error" and project_id:
+        try:
+            from tools.notification_sender import send_notification
+            send_notification(
+                department="operations", type="alert",
+                title=f"Scenario {scenario_id} execution failed",
+                message=f"Error: {error_message or 'Unknown error'}",
+                reference_type="deployment", reference_id=project_id,
+            )
+        except Exception:
+            pass
+
+        # Check for 3 consecutive errors
+        try:
+            recent = db.execute(text(
+                "SELECT status FROM execution_events "
+                "WHERE scenario_id = :sid ORDER BY received_at DESC LIMIT 3"
+            ), {"sid": scenario_id}).fetchall()
+            if len(recent) >= 3 and all(r[0] == "error" for r in recent):
+                try:
+                    from tools.notification_sender import send_notification
+                    send_notification(
+                        department="operations", type="alert",
+                        title=f"Scenario {scenario_id}: 3 consecutive failures",
+                        message="Auto-repair recommended. Check scenario configuration.",
+                        reference_type="deployment", reference_id=project_id,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return {"received": True, "processed": True, "scenario_id": scenario_id, "status": status}
+
+
+@app.post("/learn/outcome")
+def learn_outcome(request: LearnOutcomeRequest):
+    """
+    Record deployment outcome and embed it for future learning.
+    Feeds success/failure data back into the similarity engine.
+    """
+    from tools.embedding_engine import EmbeddingEngine
+    engine = EmbeddingEngine()
+
+    error_str = ", ".join(request.error_patterns) if request.error_patterns else "none"
+    learning_summary = (
+        f"Scenario {request.scenario_id}: {request.outcome} after "
+        f"{request.execution_count} executions. "
+        f"Avg duration: {request.avg_duration_ms:.0f}ms. Patterns: {error_str}"
+    )
+
+    engine.add_document(request.project_id, learning_summary, {"outcome": request.outcome})
+
+    return {
+        "learned": True,
+        "project_id": request.project_id,
+        "scenario_id": request.scenario_id,
+        "embedded": True,
+        "learning_summary": learning_summary,
+    }
+
+
+@app.get("/learn/insights")
+def learn_insights(description: str = Query(...), top_n: int = 3):
+    """
+    Search past deployment outcomes similar to description.
+    Returns risk assessment based on historical success/failure.
+    """
+    from tools.embedding_engine import EmbeddingEngine
+    engine = EmbeddingEngine()
+
+    results = engine.search(description, top_n=top_n)
+
+    outcomes = []
+    success_count = 0
+    failure_count = 0
+    for doc_id, score, metadata in results:
+        outcome = metadata.get("outcome", "unknown") if metadata else "unknown"
+        outcomes.append({
+            "project_id": doc_id,
+            "similarity": round(score, 3),
+            "outcome": outcome,
+        })
+        if outcome == "success":
+            success_count += 1
+        elif outcome == "failure":
+            failure_count += 1
+
+    total = success_count + failure_count
+    if total == 0:
+        risk_level = "unknown"
+        recommendation = "No similar deployment history found. Proceed with standard verification."
+    elif failure_count > success_count:
+        risk_level = "high"
+        recommendation = "High risk — similar projects had issues. Review carefully."
+    elif failure_count > 0:
+        risk_level = "medium"
+        recommendation = "Medium risk — some similar projects had issues. Extra testing recommended."
+    else:
+        risk_level = "low"
+        recommendation = "Low risk — similar projects succeeded."
+
+    return {
+        "similar_outcomes": outcomes,
+        "recommendation": recommendation,
+        "risk_level": risk_level,
+    }
+
+
 @app.get("/health/full")
 def health_full(db: Session = Depends(get_db)):
     """
@@ -2656,7 +3012,7 @@ def health_full(db: Session = Depends(get_db)):
         "execution_snapshots", "client_snapshots", "agent_handoffs",
         "project_financials", "project_agent_state", "client_context",
         "verification_runs", "deployments", "persona_client_context",
-        "persona_feedback",
+        "persona_feedback", "execution_events",
     ]
     table_status = {}
     for table in core_tables:
