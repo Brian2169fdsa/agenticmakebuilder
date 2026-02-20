@@ -3683,3 +3683,55 @@ def clients_health(db: Session = Depends(get_db)):
     }
 
     return {"clients": clients, "total": len(clients), "summary": summary}
+
+
+# ── GET /clients/list ───────────────────────────────────────────
+
+
+@app.get("/clients/list")
+def clients_list(db: Session = Depends(get_db)):
+    """
+    Return distinct clients from client_context with project stats.
+
+    Each client includes project_count, last_updated, key_decisions count,
+    and tech_stack summary. Sorted by last_updated desc.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT
+                cc.client_id,
+                COUNT(DISTINCT cc.project_id) AS project_count,
+                MAX(cc.updated_at) AS last_updated,
+                COALESCE(SUM(jsonb_array_length(COALESCE(cc.key_decisions, '[]'::jsonb))), 0) AS decisions_count,
+                (
+                    SELECT jsonb_agg(DISTINCT elem)
+                    FROM client_context cc2,
+                         jsonb_array_elements_text(COALESCE(cc2.tech_stack, '[]'::jsonb)) AS elem
+                    WHERE cc2.client_id = cc.client_id
+                ) AS tech_stack_all
+            FROM client_context cc
+            GROUP BY cc.client_id
+            ORDER BY MAX(cc.updated_at) DESC NULLS LAST
+        """)).fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+    clients = []
+    for row in rows:
+        tech_stack = []
+        if row.tech_stack_all:
+            try:
+                import json
+                tech_stack = json.loads(row.tech_stack_all) if isinstance(row.tech_stack_all, str) else list(row.tech_stack_all)
+            except Exception:
+                tech_stack = []
+
+        clients.append({
+            "client_id": row.client_id,
+            "project_count": int(row.project_count),
+            "last_updated": row.last_updated.isoformat() if row.last_updated else None,
+            "key_decisions_count": int(row.decisions_count),
+            "tech_stack": tech_stack,
+        })
+
+    return {"clients": clients, "total": len(clients)}
