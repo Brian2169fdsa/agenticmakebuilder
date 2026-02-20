@@ -1027,3 +1027,47 @@ def persona_memory(request: PersonaMemoryRequest, db: Session = Depends(get_db))
         "created_at": record.created_at.isoformat(),
         "updated_at": record.updated_at.isoformat(),
     }
+
+
+# ─────────────────────────────────────────
+# GET /persona/context
+# ─────────────────────────────────────────
+
+@app.get("/persona/context")
+def persona_context(
+    persona: str = Query(..., description="Persona name"),
+    client_id: str = Query(..., description="Client identifier"),
+    db: Session = Depends(get_db),
+):
+    """
+    Return a persona's full context for a given client.
+    Includes tone preferences, past interactions summary,
+    and communication style so every conversation starts informed.
+    """
+    p = _validate_persona(persona)
+
+    record = (
+        db.query(PersonaClientContext)
+        .filter(
+            PersonaClientContext.persona == p,
+            PersonaClientContext.client_id == client_id.strip(),
+        )
+        .first()
+    )
+
+    if not record:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No context found for persona '{p}' with client_id '{client_id}'",
+        )
+
+    return {
+        "id": str(record.id),
+        "persona": record.persona,
+        "client_id": record.client_id,
+        "tone_preferences": record.tone_preferences,
+        "past_interactions_summary": record.past_interactions_summary,
+        "communication_style": record.communication_style,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+    }
