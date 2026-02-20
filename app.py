@@ -4313,3 +4313,117 @@ def admin_reset_project(request: AdminResetRequest, db: Session = Depends(get_db
         "new_agent": new_agent,
         "reset_at": now.isoformat(),
     }
+
+
+# ── POST /admin/bulk-verify ─────────────────────────────────────
+
+
+class BulkVerifyRequest(BaseModel):
+    project_ids: list[str]
+    blueprint: dict
+
+
+@app.post("/admin/bulk-verify")
+def admin_bulk_verify(request: BulkVerifyRequest, db: Session = Depends(get_db)):
+    """
+    Bulk-verify a blueprint for up to 10 projects.
+
+    Runs the same validation as /verify/auto for each project_id in sequence.
+    Returns results list with per-project confidence_score, passed, auto_advanced.
+    """
+    if not request.project_ids:
+        raise HTTPException(status_code=400, detail="project_ids list is required")
+    if len(request.project_ids) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 projects per bulk verify")
+    if not request.blueprint or not isinstance(request.blueprint, dict):
+        raise HTTPException(status_code=400, detail="blueprint must be a non-empty JSON object")
+
+    # Run validation once (same blueprint for all)
+    try:
+        export_report = validate_make_export(request.blueprint, _registry)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export validation failed: {str(e)}")
+
+    canonical_report = _run_supplementary_checks(request.blueprint, _registry)
+
+    all_errors = export_report.get("errors", []) + canonical_report.get("errors", [])
+    all_warnings = export_report.get("warnings", []) + canonical_report.get("warnings", [])
+    merged_report = {
+        "errors": all_errors,
+        "warnings": all_warnings,
+        "checks_run": export_report.get("checks_run", 0) + canonical_report.get("checks_run", 0),
+        "checks_passed": export_report.get("checks_passed", 0) + canonical_report.get("checks_passed", 0),
+    }
+
+    confidence = compute_confidence(merged_report, agent_notes=[], retry_count=0)
+    score_100 = round(confidence["score"] * 100, 1)
+    passed = score_100 >= 85 and len(all_errors) == 0
+
+    fix_instructions = []
+    if not passed:
+        fix_instructions = _generate_fix_instructions(all_errors, all_warnings, score_100)
+
+    results = []
+    for pid in request.project_ids:
+        try:
+            project_uuid = UUID(pid)
+        except (ValueError, AttributeError):
+            results.append({"project_id": pid, "error": "Invalid UUID", "confidence_score": 0, "passed": False, "auto_advanced": False})
+            continue
+
+        auto_advanced = False
+
+        # Log verification run
+        try:
+            run = VerificationRun(
+                project_id=project_uuid,
+                confidence_score=score_100,
+                passed=passed,
+                error_count=len(all_errors),
+                warning_count=len(all_warnings),
+                fix_instructions=fix_instructions if fix_instructions else None,
+            )
+            db.add(run)
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Auto-advance if passed
+        if passed:
+            try:
+                state = db.query(ProjectAgentState).filter(
+                    ProjectAgentState.project_id == project_uuid
+                ).first()
+                if state and state.current_stage in ("verify", "build"):
+                    now = datetime.now(timezone.utc)
+                    state.current_stage = "deploy"
+                    state.current_agent = "deployer"
+                    state.updated_at = now
+                    history = state.stage_history or []
+                    history.append({
+                        "stage": "deploy",
+                        "agent": "deployer",
+                        "started_at": now.isoformat(),
+                        "auto_advanced_from": state.current_stage,
+                        "bulk_verify": True,
+                    })
+                    state.stage_history = history
+                    db.commit()
+                    auto_advanced = True
+            except Exception:
+                db.rollback()
+
+        results.append({
+            "project_id": pid,
+            "confidence_score": score_100,
+            "grade": confidence["grade"],
+            "passed": passed,
+            "auto_advanced": auto_advanced,
+        })
+
+    return {
+        "results": results,
+        "total": len(results),
+        "blueprint_score": score_100,
+        "fix_instructions": fix_instructions,
+    }
