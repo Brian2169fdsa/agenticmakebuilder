@@ -22,14 +22,18 @@ HTTP status codes:
 """
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
+from uuid import UUID
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from db.session import get_db, check_db
+from db.models import AgentHandoff, ProjectFinancial, Project
 from tools.module_registry_loader import load_module_registry
 from tools.build_scenario_pipeline import build_scenario_pipeline
 from tools.generate_delivery_assessment import generate_delivery_assessment
@@ -106,6 +110,23 @@ class AuditRequest(BaseModel):
 class VerifyRequest(BaseModel):
     """Verify a blueprint JSON against the full 77-rule validation audit."""
     blueprint: dict                        # Make.com export JSON
+
+
+class HandoffRequest(BaseModel):
+    """Multi-agent orchestration handoff."""
+    from_agent: str
+    to_agent: str
+    project_id: str                        # UUID as string
+    context_bundle: Optional[dict] = None
+
+
+class CostTrackRequest(BaseModel):
+    """Track token costs for a project operation."""
+    project_id: str                        # UUID as string
+    model: str                             # e.g. "claude-sonnet-4-6"
+    input_tokens: int
+    output_tokens: int
+    operation_type: str                    # e.g. "assess", "build", "iterate"
 
 
 # ─────────────────────────────────────────
@@ -769,6 +790,57 @@ def _generate_fix_instructions(errors, warnings, score_100):
             "Rebuild from canonical spec rather than patching.")
 
     return instructions
+
+
+# ─────────────────────────────────────────
+# POST /handoff — Multi-agent orchestration bridge
+# ─────────────────────────────────────────
+
+@app.post("/handoff")
+def handoff(request: HandoffRequest, db: Session = Depends(get_db)):
+    """
+    Record an agent-to-agent handoff in the orchestration pipeline.
+
+    Stores from_agent, to_agent, project_id, and an arbitrary context_bundle
+    to the agent_handoffs table. This is the bridge that allows Assessor,
+    Builder, and Validator agents to pass state to each other.
+    """
+    if not request.from_agent.strip():
+        raise HTTPException(status_code=400, detail="from_agent is required")
+    if not request.to_agent.strip():
+        raise HTTPException(status_code=400, detail="to_agent is required")
+
+    try:
+        project_uuid = UUID(request.project_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="project_id must be a valid UUID")
+
+    # Verify project exists
+    project = db.query(Project).filter(Project.id == project_uuid).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+
+    try:
+        record = AgentHandoff(
+            from_agent=request.from_agent.strip(),
+            to_agent=request.to_agent.strip(),
+            project_id=project_uuid,
+            context_bundle=request.context_bundle,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to store handoff: {str(e)}")
+
+    return {
+        "id": str(record.id),
+        "from_agent": record.from_agent,
+        "to_agent": record.to_agent,
+        "project_id": str(record.project_id),
+        "created_at": record.created_at.isoformat(),
+    }
 
 
 def _audit_recommendations(errors, warnings, confidence):

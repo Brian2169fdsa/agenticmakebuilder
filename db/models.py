@@ -1,7 +1,8 @@
 """
 SQLAlchemy ORM Models
 Maps to the PostgreSQL schema in db/schema.sql.
-Tables: projects, builds, build_artifacts, assumptions.
+Tables: projects, builds, build_artifacts, assumptions,
+        persona_client_context, persona_feedback.
 All enum-like columns use plain TEXT — no PostgreSQL enum types.
 """
 
@@ -118,3 +119,43 @@ class Assumption(Base):
     )
 
     build = relationship("Build", back_populates="assumptions_list")
+
+
+class AgentHandoff(Base):
+    __tablename__ = "agent_handoffs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    from_agent = Column(Text, nullable=False)
+    to_agent = Column(Text, nullable=False)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    context_bundle = Column(JSONB)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    project = relationship("Project")
+
+
+class ProjectFinancial(Base):
+    __tablename__ = "project_financials"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    model = Column(Text, nullable=False)
+    input_tokens = Column(Integer, nullable=False)
+    output_tokens = Column(Integer, nullable=False)
+    operation_type = Column(Text, nullable=False)
+    cost_usd = Column(Float, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

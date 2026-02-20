@@ -156,3 +156,32 @@ CREATE TABLE IF NOT EXISTS client_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_client_snapshots_name ON client_snapshots(customer_name, snapshot_date DESC);
+
+-- ── Agent handoffs (multi-agent orchestration) ──────────────
+
+CREATE TABLE IF NOT EXISTS agent_handoffs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    from_agent TEXT NOT NULL,
+    to_agent TEXT NOT NULL,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    context_bundle JSONB,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_handoffs_project ON agent_handoffs(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_handoffs_to_agent ON agent_handoffs(to_agent, created_at DESC);
+
+-- ── Project financials (token cost tracking) ────────────────
+
+CREATE TABLE IF NOT EXISTS project_financials (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    operation_type TEXT NOT NULL,
+    cost_usd FLOAT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_financials_project ON project_financials(project_id, created_at DESC);
