@@ -39,8 +39,16 @@ _registry = {}
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global _registry
-    _registry = load_module_registry()
+    print(">>> STARTUP: Loading module registry...")
+    try:
+        _registry = load_module_registry()
+        print(f">>> STARTUP: Registry loaded ({_registry.get('module_count', 0)} modules)")
+    except Exception as e:
+        print(f">>> STARTUP ERROR loading registry: {e}")
+        _registry = {"registry_version": "0", "modules": {}, "module_count": 0}
+    print(">>> STARTUP: Checking database...")
     check_db()
+    print(">>> STARTUP: Ready to serve requests")
     yield
 
 
