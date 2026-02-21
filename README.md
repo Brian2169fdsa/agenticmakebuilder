@@ -1,8 +1,8 @@
 # agenticmakebuilder v3.0.0
 
-![Python 3.13](https://img.shields.io/badge/Python-3.13-blue?logo=python&logoColor=white)
+![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?logo=fastapi&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-206%20passing-brightgreen?logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/Tests-208%20passing-brightgreen?logo=pytest&logoColor=white)
 ![Endpoints](https://img.shields.io/badge/Endpoints-79-orange)
 ![Make.com](https://img.shields.io/badge/Make.com-Live%20Deploy-7B68EE)
 ![Railway](https://img.shields.io/badge/Railway-Deployed-000?logo=railway)
@@ -11,7 +11,7 @@
 
 Agenticmakebuilder is ManageAI's agentic delivery platform. It takes a natural language project brief, runs it through a multi-agent pipeline (assess, build, verify, deploy), and produces validated Make.com scenario blueprints ready for client handoff. The platform tracks costs, learns from past projects, and self-heals when things go wrong.
 
-v3.0.0 adds API key authentication, a background job queue with worker threads, a webhook event bus, multi-tenant isolation, a full CLI tool, and 206+ tests with end-to-end coverage.
+v3.0.0 adds API key authentication, a background job queue with worker threads, a webhook event bus, multi-tenant isolation, a full CLI tool, and 208 tests with end-to-end coverage.
 
 ## Architecture
 
@@ -272,7 +272,7 @@ Event types: `project.created`, `project.plan_generated`, `project.verified`, `p
 source .venv/bin/activate
 pip install pytest httpx
 pytest tests/ -v
-# Expected: 206 passed
+# Expected: 208 passed
 ```
 
 Test files:
