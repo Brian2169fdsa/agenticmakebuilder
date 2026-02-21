@@ -7,6 +7,7 @@ monitoring, and managing scenarios programmatically.
 Reads MAKECOM_API_KEY, MAKECOM_TEAM_ID, MAKECOM_ORG_ID from environment.
 Raises MakecomError if credentials not configured or API calls fail.
 """
+from __future__ import annotations
 
 import json
 import os

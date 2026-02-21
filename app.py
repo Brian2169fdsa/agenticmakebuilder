@@ -125,6 +125,7 @@ HTTP status codes:
   500 — internal pipeline error
   502 — upstream API error (Make.com, n8n, Claude)
 """
+from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -447,19 +448,23 @@ def plan(
     request: AssessRequest,
     db: Session = Depends(get_db),
     async_mode: bool = Query(False),
+    target: str = Query("make", pattern="^(make|n8n)$"),
 ):
     """
     Full pipeline: assess → build → 11 artifacts.
     Now enriched with similar past projects and client memory context.
     Pass ?async_mode=true to enqueue as a background job.
+    Pass ?target=n8n to generate n8n workflow JSON instead of Make.com blueprint.
     Returns 422 if assessment is incomplete or confidence is too low.
     Returns 500 on pipeline exception.
     """
     if async_mode:
         from tools.job_queue import enqueue_job
+        payload = request.model_dump()
+        payload["_target"] = target
         job_id = enqueue_job(
             job_type="plan",
-            payload=request.model_dump(),
+            payload=payload,
             project_id=None,
         )
         return {"job_id": job_id, "status": "pending", "poll_url": f"/jobs/{job_id}"}
@@ -540,6 +545,7 @@ def plan(
             original_request=intake.get("original_request", ""),
             db_session=db,
             project_name=project_name,
+            target=target,
         )
         db.commit()
     except Exception as e:
@@ -576,6 +582,7 @@ def plan(
     response = {
         "ready_for_build": True,
         "success": True,
+        "target": target,
         "delivery_report": assessment.get("delivery_report"),
         "build_result": build_result,
     }
@@ -3450,7 +3457,7 @@ def command(request: CommandRequest, db: Session = Depends(get_db)):
     }
 
 
-def _extract_name_from_command(cmd: str) -> str | None:
+def _extract_name_from_command(cmd: str) -> Optional[str]:
     """Extract a customer/project name from a command string."""
     for prep in [" for ", " of ", " from "]:
         if prep in cmd:
@@ -3458,7 +3465,7 @@ def _extract_name_from_command(cmd: str) -> str | None:
     return None
 
 
-def _extract_uuid_from_command(cmd: str) -> str | None:
+def _extract_uuid_from_command(cmd: str) -> Optional[str]:
     """Extract a UUID-like string from a command."""
     import re
     match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", cmd)

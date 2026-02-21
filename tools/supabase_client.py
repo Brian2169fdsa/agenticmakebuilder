@@ -7,6 +7,7 @@ real-time sync of pipeline state, costs, and agent actions.
 Reads SUPABASE_URL and SUPABASE_SERVICE_KEY from environment.
 Falls back gracefully (returns None/empty) if not configured.
 """
+from __future__ import annotations
 
 import os
 from typing import Optional

@@ -48,6 +48,7 @@ from tools.normalize_to_canonical_spec import normalize_to_canonical_spec
 from tools.validate_canonical_spec import validate_canonical_spec
 from tools.confidence_scorer import compute_confidence
 from tools.generate_make_export import generate_make_export
+from tools.generate_n8n_export import generate_n8n_export
 from tools.validate_make_export import validate_make_export
 from tools.self_heal_make_export import self_heal_make_export
 from tools.spec_version_manager import save_versioned_spec
@@ -64,7 +65,8 @@ MIN_CONFIDENCE = 0.70
 
 def build_scenario_pipeline(plan, registry, original_request,
                             base_output_dir=None, created_at=None,
-                            db_session=None, project_name="default"):
+                            db_session=None, project_name="default",
+                            target="make"):
     """Orchestrate the full scenario build lifecycle.
 
     Args:
@@ -76,11 +78,13 @@ def build_scenario_pipeline(plan, registry, original_request,
         db_session: Optional SQLAlchemy Session. When provided, all artifacts
             are persisted to PostgreSQL instead of the filesystem.
         project_name: Project name for DB grouping (default: "default").
+        target: Build target platform — "make" (default) or "n8n".
 
     Returns:
         dict with success, slug, version, output_path, confidence,
         canonical_validation, export_validation, heal_result,
-        delivery_summary, failure_reason.
+        delivery_summary, failure_reason. When target="n8n", includes
+        n8n_workflow instead of Make.com blueprint.
     """
     plan = copy.deepcopy(plan)
     result = _empty_result()
@@ -138,49 +142,72 @@ def build_scenario_pipeline(plan, registry, original_request,
             result["delivery_summary"] = _build_failure_summary(result)
             return result
 
-        # === Phase 2: Generate Make.com blueprint ===
-        blueprint = generate_make_export(spec)
-
-        # === Phase 3: Validate Make.com export ===
-        export_report = validate_make_export(blueprint, registry)
-        result["export_validation"] = _summarize_validation(export_report)
-
-        # === Phase 4: Self-heal if needed ===
-        if not export_report["valid"]:
-            heal = self_heal_make_export(blueprint, registry, max_retries=2)
-            result["heal_result"] = {
-                "retries_used": heal["retries_used"],
-                "repairs": len(heal["repair_log"]),
-                "repair_log": heal["repair_log"]
+        # === Phase 2: Generate export for target platform ===
+        n8n_result = None
+        if target == "n8n":
+            n8n_result = generate_n8n_export(spec, registry)
+            blueprint = n8n_result["workflow"]
+            # n8n export: structural validation (nodes, connections present)
+            n8n_errors = []
+            if not blueprint.get("nodes"):
+                n8n_errors.append({"rule_id": "n8n_nodes", "message": "Workflow has no nodes"})
+            if not blueprint.get("name"):
+                n8n_errors.append({"rule_id": "n8n_name", "message": "Workflow has no name"})
+            export_report = {
+                "valid": len(n8n_errors) == 0,
+                "checks_run": 2,
+                "checks_passed": 2 - len(n8n_errors),
+                "errors": n8n_errors,
+                "warnings": [{"rule_id": "n8n_unmapped", "message": m}
+                             for m in n8n_result.get("unmapped_modules", [])],
             }
-            blueprint = heal["blueprint"]
-            export_report = heal["final_validation"]
             result["export_validation"] = _summarize_validation(export_report)
-            heal_attempts = heal["retries_used"]
+            result["n8n_workflow"] = blueprint
+            result["n8n_agent_notes"] = n8n_result.get("agent_notes", [])
+            result["n8n_unmapped_modules"] = n8n_result.get("unmapped_modules", [])
+        else:
+            blueprint = generate_make_export(spec)
 
-            if not heal["success"]:
-                remaining_errors = [e["message"] for e in export_report.get("errors", [])[:5]]
-                result["failure_reason"] = (
-                    f"Make export validation failed after {heal['retries_used']} repair attempt(s). "
-                    f"Remaining errors: {remaining_errors}"
-                )
-                if db_session and build_id:
-                    store_artifact(db_session, build_id, "canonical_spec", content_json=spec)
-                    store_artifact(db_session, build_id, "validation_report", content_json=spec_report)
-                    store_artifact(db_session, build_id, "confidence", content_json=confidence)
-                    store_artifact(db_session, build_id, "make_export", content_json=blueprint)
-                    store_artifact(db_session, build_id, "export_validation_report", content_json=export_report)
-                    finalize_build(
-                        db_session, build_id, "failed",
-                        confidence_score=confidence["score"],
-                        confidence_grade=confidence["grade"],
-                        canonical_valid=spec_report.get("valid", False),
-                        export_valid=False,
-                        heal_attempts=heal_attempts,
-                        failure_reason=result["failure_reason"],
+            # === Phase 3: Validate Make.com export ===
+            export_report = validate_make_export(blueprint, registry)
+            result["export_validation"] = _summarize_validation(export_report)
+
+            # === Phase 4: Self-heal if needed ===
+            if not export_report["valid"]:
+                heal = self_heal_make_export(blueprint, registry, max_retries=2)
+                result["heal_result"] = {
+                    "retries_used": heal["retries_used"],
+                    "repairs": len(heal["repair_log"]),
+                    "repair_log": heal["repair_log"]
+                }
+                blueprint = heal["blueprint"]
+                export_report = heal["final_validation"]
+                result["export_validation"] = _summarize_validation(export_report)
+                heal_attempts = heal["retries_used"]
+
+                if not heal["success"]:
+                    remaining_errors = [e["message"] for e in export_report.get("errors", [])[:5]]
+                    result["failure_reason"] = (
+                        f"Make export validation failed after {heal['retries_used']} repair attempt(s). "
+                        f"Remaining errors: {remaining_errors}"
                     )
-                result["delivery_summary"] = _build_failure_summary(result)
-                return result
+                    if db_session and build_id:
+                        store_artifact(db_session, build_id, "canonical_spec", content_json=spec)
+                        store_artifact(db_session, build_id, "validation_report", content_json=spec_report)
+                        store_artifact(db_session, build_id, "confidence", content_json=confidence)
+                        store_artifact(db_session, build_id, "make_export", content_json=blueprint)
+                        store_artifact(db_session, build_id, "export_validation_report", content_json=export_report)
+                        finalize_build(
+                            db_session, build_id, "failed",
+                            confidence_score=confidence["score"],
+                            confidence_grade=confidence["grade"],
+                            canonical_valid=spec_report.get("valid", False),
+                            export_valid=False,
+                            heal_attempts=heal_attempts,
+                            failure_reason=result["failure_reason"],
+                        )
+                    result["delivery_summary"] = _build_failure_summary(result)
+                    return result
 
         # === Phase 5: Persist Artifacts ===
         if db_session:
@@ -192,7 +219,8 @@ def build_scenario_pipeline(plan, registry, original_request,
             store_artifact(db_session, build_id, "validation_report", content_json=spec_report)
             store_artifact(db_session, build_id, "confidence", content_json=confidence)
             store_artifact(db_session, build_id, "build_log", content_text=build_log_md)
-            store_artifact(db_session, build_id, "make_export", content_json=blueprint)
+            export_artifact_name = "n8n_export" if target == "n8n" else "make_export"
+            store_artifact(db_session, build_id, export_artifact_name, content_json=blueprint)
             store_artifact(db_session, build_id, "export_validation_report", content_json=export_report)
 
             timeline = estimate_timeline(spec)
@@ -234,7 +262,8 @@ def build_scenario_pipeline(plan, registry, original_request,
             result["version"] = version_result["version"]
             result["output_path"] = version_result["output_path"]
 
-            export_path = os.path.join(version_result["output_path"], "make_export.json")
+            export_filename = "n8n_export.json" if target == "n8n" else "make_export.json"
+            export_path = os.path.join(version_result["output_path"], export_filename)
             with open(export_path, "w") as f:
                 json.dump(blueprint, f, indent=2, default=str)
 
@@ -262,10 +291,11 @@ def build_scenario_pipeline(plan, registry, original_request,
             with open(pack_path, "w") as f:
                 json.dump(delivery["pack_json"], f, indent=2, default=str)
 
-            generate_blueprint(
-                output_path=version_result["output_path"],
-                customer_name=spec.get("scenario_name", "Customer").split(":")[0].strip(),
-            )
+            if target != "n8n":
+                generate_blueprint(
+                    output_path=version_result["output_path"],
+                    customer_name=spec.get("scenario_name", "Customer").split(":")[0].strip(),
+                )
 
             result["success"] = True
             result["delivery_summary"] = _build_success_summary(

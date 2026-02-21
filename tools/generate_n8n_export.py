@@ -245,8 +245,10 @@ def generate_n8n_export(canonical_spec: dict, registry: dict = None) -> dict:
     unmapped_modules = []
 
     trigger = canonical_spec.get("trigger", {})
-    steps = canonical_spec.get("steps", [])
-    scenario_name = canonical_spec.get("scenario_name", "ManageAI Workflow")
+    # Support both canonical spec format (modules) and raw plan format (steps)
+    steps = canonical_spec.get("modules", []) or canonical_spec.get("steps", [])
+    scenario = canonical_spec.get("scenario", {})
+    scenario_name = scenario.get("name") or canonical_spec.get("scenario_name", "ManageAI Workflow")
 
     node_ids = []
     nodes = []

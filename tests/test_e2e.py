@@ -231,3 +231,24 @@ class TestE2EPipeline:
         assert data["job_id"] == "async-e2e-001"
         assert data["status"] == "pending"
         assert "/jobs/" in data["poll_url"]
+
+    @patch("tools.job_queue.enqueue_job", return_value="async-n8n-001")
+    def test_async_plan_n8n_target(self, mock_enqueue, client):
+        """POST /plan?async_mode=true&target=n8n passes target through."""
+        r = client.post("/plan?async_mode=true&target=n8n", json={
+            "original_request": "Build webhook to Slack for Acme",
+            "customer_name": "Acme Corp",
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["job_id"] == "async-n8n-001"
+        # Confirm target was passed through to payload
+        call_kwargs = mock_enqueue.call_args
+        assert call_kwargs[1]["payload"]["_target"] == "n8n"
+
+    def test_plan_target_validation(self, client):
+        """POST /plan?target=invalid returns 422."""
+        r = client.post("/plan?target=invalid", json={
+            "original_request": "Build something",
+        })
+        assert r.status_code == 422
